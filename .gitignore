@@ -2,3 +2,24 @@ PLAN.MD
 SPECS.MD
 TASKS.MD
 *.pdf
+
+# --- Agent activity changelog (local-only; never commit or push) ---
+/agent_changelog/
+
+# --- Python artifacts ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+
+# --- Tool caches ---
+.pytest_cache/
+.ruff_cache/
+
+# --- Environment / secrets (.env.example stays tracked) ---
+.env
+
+# --- Runtime SQLite databases (only data/sample_events.json is meant for git) ---
+data/*.db*
