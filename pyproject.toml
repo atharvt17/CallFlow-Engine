@@ -30,3 +30,17 @@ dev = [
 # and intentionally not distributed.
 [tool.setuptools.packages.find]
 include = ["app*", "mock*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Default rule set (pycodestyle subset + pyflakes) plus isort import ordering.
+extend-select = ["I"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+filterwarnings = ["error"]
