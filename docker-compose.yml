@@ -1,0 +1,58 @@
+# ============================================================================
+# Environment override mechanism (M0-T07 step 3):
+# - Images do NOT copy a local `.env` (excluded via .dockerignore) and compose
+#   does not auto-inject it into containers, so container configuration comes
+#   solely from the `environment:` blocks below.
+# - Compose itself may read a local `.env` only for ${VAR} substitution inside
+#   THIS file; we deliberately use no ${} placeholders, so a local `.env`
+#   cannot fight these container settings.
+# - Defaults are spec-exact (SPECS §8); only what differs from the defaults
+#   needs to appear here (PIPELINE_BASE_URL points at the compose DNS name).
+# ============================================================================
+
+name: callflow-engine
+
+services:
+  inference:
+    build: .
+    image: collections-voice-agent:latest
+    command: python -m app.main
+    environment:
+      SERVICE_HOST: 0.0.0.0
+      SERVICE_PORT: 8000
+      # Compose-internal DNS for the mock service; overrides the localhost default.
+      PIPELINE_BASE_URL: http://mock:8100
+      # Runtime DB lives inside the named volume mounted at /srv/app/data.
+      DB_PATH: data/collections.db
+      LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+    volumes:
+      - collections-data:/srv/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    depends_on:
+      mock:
+        condition: service_healthy
+
+  mock:
+    build: .
+    image: collections-voice-agent:latest
+    command: python -m mock.main
+    environment:
+      MOCK_PORT: 8100
+    ports:
+      - "8100:8100"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8100/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
+volumes:
+  collections-data:

@@ -8,6 +8,7 @@ prescribed by the M0-T05 task definition.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Literal
 
@@ -15,6 +16,8 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 from app.config import Settings
+
+logger = logging.getLogger(__name__)
 
 # Placeholder values until the breaker (Sprint 3) and deferral (Sprint 4) exist.
 _PLACEHOLDER_CIRCUIT_STATE = "closed"
@@ -63,6 +66,16 @@ def main() -> None:
     import uvicorn
 
     settings = Settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    # Startup evidence line (M0-T07): shows the resolved dependency base URL,
+    # e.g. the compose-network address `http://mock:8100`.
+    logger.info(
+        "inference starting: pipeline backend base URL = %s",
+        settings.pipeline_base_url,
+    )
     uvicorn.run(
         "app.main:app",
         host=settings.service_host,

@@ -1,0 +1,24 @@
+# Build context stays minimal: only pyproject.toml + app/ + mock/ are copied
+# (see Dockerfile). Everything else is excluded from the context.
+.git
+.gitignore
+.venv/
+venv/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+data/
+reports/
+tests/
+tools/
+agent_changelog/
+PLAN.md
+SPECS.md
+TASKS.md
+*.pdf
+README.md
