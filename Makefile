@@ -1,0 +1,42 @@
+# CallFlow Engine (collections-voice-agent) — lifecycle verbs (M0-T08).
+# POSIX / Git Bash compatible: no bashisms, tab-indented recipes.
+
+# Prefer the project venv's interpreter; fall back to PATH python.
+# (venv layout differs between Windows and POSIX.)
+ifeq ($(OS),Windows_NT)
+  VENV_PY := .venv/Scripts/python.exe
+  PY := $(if $(wildcard $(VENV_PY)),$(VENV_PY),python)
+else
+  VENV_PY := .venv/bin/python
+  PY := $(if $(wildcard $(VENV_PY)),$(VENV_PY),python3)
+endif
+
+.PHONY: up down logs test lint demo dlq-replay
+
+## up: build and start the compose stack (inference + mock)
+up:
+	docker compose up --build -d
+
+## down: stop and remove the compose stack (named data volume is kept)
+down:
+	docker compose down
+
+## logs: follow compose logs (Ctrl+C to stop)
+logs:
+	docker compose logs -f
+
+## test: run pytest (prefers the project venv; falls back to PATH python)
+test:
+	$(PY) -m pytest -q
+
+## lint: run ruff (prefers the project venv; falls back to PATH python)
+lint:
+	$(PY) -m ruff check .
+
+## demo: compressed Appendix C day replay (placeholder until Sprint 6)
+demo:
+	@echo "make demo: not implemented until Sprint 6 (traffic generator, milestone M5)"; exit 1
+
+## dlq-replay: replay dead-letter rows (placeholder until Sprint 5)
+dlq-replay:
+	@echo "make dlq-replay: not implemented until Sprint 5 (DLQ inspect/replay, milestone M4)"; exit 1
