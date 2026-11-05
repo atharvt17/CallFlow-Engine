@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import atexit
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -16,6 +18,18 @@ from mock.main import create_mock_app
 # statistical tests are shape/rate-focused; absolute latency is calibrated
 # separately (M1-T06) with the pure sampler.
 FAST_LATENCY_MU = -3.0
+
+if sys.platform == "win32":
+    # Windows' default system timer tick (~15.6 ms) floors tiny asyncio.sleep
+    # calls at ~12 ms regardless of loop type, which would add ~50 s to the
+    # 5,000-request statistical test even with a sub-millisecond latency
+    # budget. Raising the process timer resolution to 1 ms floors them at
+    # ~1.4 ms instead. Test-infra only: production keeps OS defaults, and the
+    # resolution change is process-local (undone at interpreter exit).
+    import ctypes
+
+    _timer_resolution_set = ctypes.windll.winmm.timeBeginPeriod(1)
+    atexit.register(ctypes.windll.winmm.timeEndPeriod, 1)
 
 
 @pytest.fixture
