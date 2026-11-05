@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 
 from app import store
 from app.models import CallEvent
@@ -60,3 +60,10 @@ async def get_call(event_id: str, request: Request) -> dict[str, object]:
     if row is None:
         raise HTTPException(status_code=404, detail=f"unknown event_id: {event_id}")
     return _record_payload(row)
+
+
+@router.get("/metrics")
+async def metrics(request: Request) -> Response:
+    """Prometheus text exposition for this app's registry (SPECS §9)."""
+    body, content_type = request.app.state.metrics.render()
+    return Response(content=body, media_type=content_type)

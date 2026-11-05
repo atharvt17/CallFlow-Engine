@@ -25,6 +25,7 @@ from app import store
 from app.api import router
 from app.config import Settings
 from app.logging import log_event, setup_logging
+from app.metrics import Metrics
 from app.pipeline import PipelineBackend, create_backend
 from app.service import CallService
 
@@ -54,7 +55,8 @@ def create_app(
         backend = create_backend(settings)
     conn = store.connect(settings.db_path)
     store.init_db(conn)
-    service = CallService(conn, backend, settings)
+    metrics = Metrics()
+    service = CallService(conn, backend, settings, metrics)
     started_at = time.monotonic()
 
     @asynccontextmanager
@@ -75,6 +77,7 @@ def create_app(
     app.state.conn = conn
     app.state.service = service
     app.state.backend = backend
+    app.state.metrics = metrics
     app.state.started_at = started_at
     app.include_router(router)
 

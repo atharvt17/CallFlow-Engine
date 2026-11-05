@@ -31,6 +31,7 @@ from typing import Any
 from app import store
 from app.config import Settings
 from app.logging import log_event
+from app.metrics import Metrics
 from app.models import CallEvent, EventOutcome
 from app.pipeline.base import PipelineBackend
 
@@ -59,11 +60,16 @@ class CallService:
     """Synchronous per-event pipeline execution with durable accounting."""
 
     def __init__(
-        self, conn: sqlite3.Connection, backend: PipelineBackend, settings: Settings
+        self,
+        conn: sqlite3.Connection,
+        backend: PipelineBackend,
+        settings: Settings,
+        metrics: Metrics,
     ) -> None:
         self._conn = conn
         self._backend = backend
         self._settings = settings
+        self._metrics = metrics
         # Isolated draw stream so SUCCESS_PTP_RATE never perturbs other RNG use.
         self._ptp_draw = random.Random()
 
@@ -118,8 +124,25 @@ class CallService:
             duplicate=False,
         )
 
-        result = await self._backend.process(event_id, _AUDIO_REF)
+        # One logical call is in flight around the (currently single) attempt;
+        # Sprint 3's retry executor keeps this gauge around the whole sequence.
+        self._metrics.in_flight_calls.inc()
+        try:
+            result = await self._backend.process(event_id, _AUDIO_REF)
+        finally:
+            self._metrics.in_flight_calls.dec()
         e2e_latency_ms = (time.perf_counter() - started) * 1000
+
+        # Attempt-level observability (never feeds breaker statistics, §6.2).
+        if result.ok:
+            attempt_result = "success"
+        elif result.reason == "timeout":
+            attempt_result = "timeout"
+        else:
+            attempt_result = "error"
+        self._metrics.pipeline_attempts_total.labels(result=attempt_result).inc()
+        if result.latency_ms is not None:
+            self._metrics.pipeline_attempt_latency_ms.observe(result.latency_ms)
 
         if result.ok:
             ptp_taken = self._ptp_draw.random() < self._settings.success_ptp_rate
@@ -159,6 +182,9 @@ class CallService:
         if failure_reason is not None:
             fields["failure_reason"] = failure_reason
         log_event(logger, "call_processed" if result.ok else "call_failed", **fields)
+
+        self._metrics.calls_total.labels(outcome=outcome.value, status=status).inc()
+        self._metrics.e2e_latency_ms.observe(e2e_latency_ms)
 
         return CallAcceptance(
             event_id=event_id,

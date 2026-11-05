@@ -11,11 +11,16 @@ import logging
 from app import store
 from app.config import Settings
 from app.logging import JsonFormatter
+from app.metrics import Metrics
 from app.models import CallEvent
 from app.pipeline.base import PipelineResult
 from app.service import CallService
 
 NOW = "2026-09-01T09:03:12+00:00"
+
+
+def make_service(tmp_db, backend, settings: Settings) -> CallService:
+    return CallService(tmp_db, backend, settings, Metrics())
 
 
 def make_event(event_id: str = "a1f2c3d4-e89b-12d3-a456-426614174000") -> CallEvent:
@@ -63,7 +68,7 @@ class InspectingBackend:
 
 async def test_happy_path_processed(tmp_db) -> None:
     backend = RecordingBackend(PipelineResult(ok=True, http_status=200, latency_ms=312.0))
-    service = CallService(tmp_db, backend, Settings(success_ptp_rate=0.0))
+    service = make_service(tmp_db, backend, Settings(success_ptp_rate=0.0))
     event = make_event()
 
     acceptance = await service.accept(event)
@@ -90,7 +95,7 @@ async def test_happy_path_processed(tmp_db) -> None:
 
 async def test_success_ptp_rate_one_yields_ptp_taken(tmp_db) -> None:
     backend = RecordingBackend(PipelineResult(ok=True, http_status=200, latency_ms=1.0))
-    service = CallService(tmp_db, backend, Settings(success_ptp_rate=1.0))
+    service = make_service(tmp_db, backend, Settings(success_ptp_rate=1.0))
     acceptance = await service.accept(make_event())
     assert acceptance.outcome == "ptp_taken"
     assert acceptance.status == "processed"
@@ -100,7 +105,7 @@ async def test_failure_maps_to_failed_downstream(tmp_db) -> None:
     backend = RecordingBackend(
         PipelineResult(ok=False, reason="downstream_timeout", http_status=503, latency_ms=40.0)
     )
-    service = CallService(tmp_db, backend, Settings())
+    service = make_service(tmp_db, backend, Settings())
     acceptance = await service.accept(make_event())
 
     assert acceptance.status == "failed_downstream"
@@ -120,7 +125,7 @@ async def test_failure_maps_to_failed_downstream(tmp_db) -> None:
 
 async def test_duplicate_short_circuits_without_redispatch(tmp_db) -> None:
     backend = RecordingBackend(PipelineResult(ok=True, http_status=200, latency_ms=10.0))
-    service = CallService(tmp_db, backend, Settings())
+    service = make_service(tmp_db, backend, Settings())
     event = make_event()
 
     first = await service.accept(event)
@@ -140,7 +145,7 @@ async def test_duplicate_short_circuits_without_redispatch(tmp_db) -> None:
 async def test_lost_insert_race_answered_as_duplicate(tmp_db) -> None:
     """Concurrent duplicate: the PK guarantees exactly one INSERT wins."""
     backend = RecordingBackend(PipelineResult(ok=True, http_status=200, latency_ms=1.0))
-    service = CallService(tmp_db, backend, Settings())
+    service = make_service(tmp_db, backend, Settings())
     event = make_event()
     store.insert_event(tmp_db, event, status="processing", created_at=NOW, updated_at=NOW)
 
@@ -156,7 +161,7 @@ async def test_persist_before_dispatch(tmp_db) -> None:
     backend = InspectingBackend(
         tmp_db, PipelineResult(ok=False, reason="downstream_timeout", http_status=503)
     )
-    service = CallService(tmp_db, backend, Settings())
+    service = make_service(tmp_db, backend, Settings())
     acceptance = await service.accept(make_event())
     assert acceptance.status == "failed_downstream"
 
