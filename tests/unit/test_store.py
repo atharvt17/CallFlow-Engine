@@ -111,3 +111,15 @@ def test_connect_creates_parent_directories(tmp_path) -> None:
         assert db_path.exists()
     finally:
         conn.close()
+
+
+def test_init_db_is_idempotent_on_existing_schema(tmp_db) -> None:
+    """Boot against an existing store must be a no-op (restart safety, §6.3)."""
+    store.init_db(tmp_db)  # second call: both tables present -> no error, no DDL rerun
+    names = {
+        row["name"]
+        for row in tmp_db.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
+        )
+    }
+    assert {"call_events", "dead_letter", "idx_call_events_status", "idx_dead_letter_status"} <= names

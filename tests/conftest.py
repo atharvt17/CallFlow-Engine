@@ -6,12 +6,16 @@ import atexit
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
 from app import store
+from app.config import Settings
+from app.main import create_app
+from app.pipeline.http_client import HttpPipelineClient
 from mock.config import MockSettings
 from mock.main import create_mock_app
 
@@ -19,6 +23,50 @@ from mock.main import create_mock_app
 # statistical tests are shape/rate-focused; absolute latency is calibrated
 # separately (M1-T06) with the pure sampler.
 FAST_LATENCY_MU = -3.0
+
+
+@pytest.fixture
+def make_stack(tmp_path):
+    """Factory fixture: inference ASGI client wired to an in-process mock app.
+
+    The inference's HTTP backend talks to the mock through transport
+    injection (``HttpPipelineClient(settings, transport=ASGITransport(mock))``),
+    so the full POST /calls -> backend -> mock -> store flow runs without any
+    live server. Yields ``(httpx client, db_path)`` for accounting asserts.
+    """
+
+    @asynccontextmanager
+    async def _stack(
+        mock_overrides: dict[str, float] | None = None,
+        **inference_overrides: float | str,
+    ) -> AsyncIterator[tuple[httpx.AsyncClient, Path]]:
+        mock_app = create_mock_app(
+            MockSettings(latency_mu=FAST_LATENCY_MU, **(mock_overrides or {}))
+        )
+        db_path = tmp_path / "calls.db"
+        settings = Settings(
+            db_path=str(db_path),
+            pipeline_backend="http",
+            pipeline_base_url="http://mock.test",
+            **inference_overrides,
+        )
+        backend = HttpPipelineClient(settings, transport=httpx.ASGITransport(app=mock_app))
+        app = create_app(settings, backend)
+        conn = app.state.conn
+        try:
+            # Note: httpx.ASGITransport does NOT run the app lifespan, so the
+            # store connection and backend pool are closed here explicitly —
+            # unclosed sqlite connections would otherwise raise
+            # ResourceWarning at GC time (escalated to errors by pytest).
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://inference.test"
+            ) as client:
+                yield client, db_path
+        finally:
+            await backend.aclose()
+            conn.close()
+
+    return _stack
 
 
 @pytest.fixture

@@ -81,7 +81,22 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """Create the SPECS §7 schema (idempotent once tables exist — caller decides)."""
+    """Create the SPECS §7 schema; a no-op when it already exists (restart safety).
+
+    The DDL text stays verbatim (no ``IF NOT EXISTS``); instead, boot against
+    an existing store skips the script when both tables are present. A partial
+    schema (one table, not the other) is left to fail loudly — that is a
+    corrupted store, not a migration case in Round 1.
+    """
+    present = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+            " AND name IN ('call_events', 'dead_letter')"
+        )
+    }
+    if present == {"call_events", "dead_letter"}:
+        return
     conn.executescript(DDL_SCRIPT)
 
 
