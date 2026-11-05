@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ProcessRequest(BaseModel):
@@ -53,3 +53,19 @@ class ProcessFailure(BaseModel):
 
     status: Literal["error"]
     reason: Literal["downstream_timeout"]
+
+
+class AdminConfigUpdate(BaseModel):
+    """Partial update for the documented ``POST /admin/config`` extension.
+
+    Validation mirrors the env-level constraints (SPECS §4/§8). Extension
+    only — it never changes the Appendix B-exact defaults that ship; invalid
+    values are rejected (FastAPI 422) before any knob is applied.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    failure_rate: float | None = Field(default=None, ge=0, le=1)
+    latency_mu: float | None = None
+    latency_sigma: float | None = Field(default=None, gt=0)
+    failure_latency_ms: float | None = Field(default=None, ge=0)

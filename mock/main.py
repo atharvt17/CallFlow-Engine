@@ -26,7 +26,7 @@ from pydantic import BaseModel
 
 from mock.config import MockSettings
 from mock.latency import sample_latency_ms
-from mock.models import ProcessFailure, ProcessRequest, ProcessSuccess
+from mock.models import AdminConfigUpdate, ProcessFailure, ProcessRequest, ProcessSuccess
 
 # Appendix B body literals (SPECS §4).
 _TRANSCRIPT = "synthetic transcript"
@@ -125,6 +125,41 @@ def create_mock_app(settings: MockSettings | None = None) -> FastAPI:
             latency_ms=latency_ms,
         )
         return JSONResponse(status_code=200, content=success.model_dump())
+
+    # --- documented extension (SPECS §4): not part of the graded contract. ---
+    # These endpoints exist for our tests/demos (e.g. FAILURE_RATE=1.0 to
+    # exercise the breaker). Defaults are always Appendix B-exact.
+
+    @app.get("/admin/stats")
+    async def admin_stats() -> dict[str, int | float]:
+        return {
+            "requests_total": state.requests_total,
+            "success": state.success,
+            "failure": state.failure,
+            "observed_failure_rate": state.observed_failure_rate,
+        }
+
+    @app.get("/admin/config")
+    async def get_admin_config() -> dict[str, float]:
+        return {
+            "failure_rate": state.failure_rate,
+            "latency_mu": state.latency_mu,
+            "latency_sigma": state.latency_sigma,
+            "failure_latency_ms": state.failure_latency_ms,
+        }
+
+    @app.post("/admin/config")
+    async def set_admin_config(update: AdminConfigUpdate) -> dict[str, float]:
+        """Apply a partial runtime config update; returns the effective config."""
+        if update.failure_rate is not None:
+            state.failure_rate = update.failure_rate
+        if update.latency_mu is not None:
+            state.latency_mu = update.latency_mu
+        if update.latency_sigma is not None:
+            state.latency_sigma = update.latency_sigma
+        if update.failure_latency_ms is not None:
+            state.failure_latency_ms = update.failure_latency_ms
+        return await get_admin_config()
 
     return app
 
