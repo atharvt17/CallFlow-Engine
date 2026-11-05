@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
+from app import store
 from mock.config import MockSettings
 from mock.main import create_mock_app
 
@@ -18,6 +19,15 @@ from mock.main import create_mock_app
 # statistical tests are shape/rate-focused; absolute latency is calibrated
 # separately (M1-T06) with the pure sampler.
 FAST_LATENCY_MU = -3.0
+
+
+@pytest.fixture
+def tmp_db(tmp_path):
+    """Fresh temp SQLite store per test (SPECS §7 pragmas + schema)."""
+    conn = store.connect(tmp_path / "test.db")
+    store.init_db(conn)
+    yield conn
+    conn.close()
 
 if sys.platform == "win32":
     # Windows' default system timer tick (~15.6 ms) floors tiny asyncio.sleep
