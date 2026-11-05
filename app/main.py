@@ -1,21 +1,32 @@
-"""FastAPI application factory for the inference service (M0 skeleton).
+"""FastAPI application factory for the inference service (M0 skeleton + M2 core).
 
 `GET /healthz` already exposes the SPECS §5 health contract. The circuit
 breaker and deferral components land in Sprints 3–4; until then the health
 endpoint reports placeholder values (``closed`` / ``0``) for their state, as
 prescribed by the M0-T05 task definition.
+
+Wiring (M2-T08): the store connection, pipeline backend, and call service are
+built eagerly in :func:`create_app` (so ASGI-level tests see complete state
+without lifespan), while cleanup runs in the lifespan shutdown hook.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Literal
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from app import store
+from app.api import router
 from app.config import Settings
+from app.logging import log_event, setup_logging
+from app.pipeline import PipelineBackend, create_backend
+from app.service import CallService
 
 logger = logging.getLogger(__name__)
 
@@ -33,18 +44,39 @@ class HealthResponse(BaseModel):
     deferred_pending: int
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
-    """Build the inference FastAPI app; settings injectable for tests."""
+def create_app(
+    settings: Settings | None = None, backend: PipelineBackend | None = None
+) -> FastAPI:
+    """Build the inference app; settings and backend injectable for tests."""
     if settings is None:
         settings = Settings()
+    if backend is None:
+        backend = create_backend(settings)
+    conn = store.connect(settings.db_path)
+    store.init_db(conn)
+    service = CallService(conn, backend, settings)
     started_at = time.monotonic()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            await backend.aclose()
+            conn.close()
 
     app = FastAPI(
         title="collections-voice-agent inference",
         version="0.1.0",
         description="Resilient collections voice-agent inference service (Round 1).",
+        lifespan=lifespan,
     )
     app.state.settings = settings
+    app.state.conn = conn
+    app.state.service = service
+    app.state.backend = backend
+    app.state.started_at = started_at
+    app.include_router(router)
 
     @app.get("/healthz", response_model=HealthResponse)
     async def healthz() -> HealthResponse:
@@ -66,16 +98,10 @@ def main() -> None:
     import uvicorn
 
     settings = Settings()
-    logging.basicConfig(
-        level=settings.log_level.upper(),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-    # Startup evidence line (M0-T07): shows the resolved dependency base URL,
+    setup_logging(settings.log_level)
+    # Startup evidence line (M0-T07): the resolved dependency base URL,
     # e.g. the compose-network address `http://mock:8100`.
-    logger.info(
-        "inference starting: pipeline backend base URL = %s",
-        settings.pipeline_base_url,
-    )
+    log_event(logger, "startup", pipeline_base_url=settings.pipeline_base_url)
     uvicorn.run(
         "app.main:app",
         host=settings.service_host,
