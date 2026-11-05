@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "collections-voice-agent"
+version = "0.1.0"
+description = "Collections voice-agent inference service with a resilience layer around a mock STT-LLM-TTS pipeline dependency (Round 1, local track)."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "httpx>=0.27",
+    "pydantic>=2",
+    "pydantic-settings>=2.2",
+    "prometheus-client>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+# Explicit discovery: the project intentionally ships two top-level packages
+# (app/ = inference service, mock/ = Appendix B dependency mock). Auto-discovery
+# would fail later with "Multiple top-level packages discovered in a flat-layout",
+# so candidates are pinned here. tests/, tools/, data/, reports/ are repo-local
+# and intentionally not distributed.
+[tool.setuptools.packages.find]
+include = ["app*", "mock*"]
