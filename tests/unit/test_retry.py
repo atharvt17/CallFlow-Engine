@@ -62,6 +62,67 @@ class TestRetryPolicyDefaults:
             )
         )
         assert jittered == pytest.approx(7.95)
+        assert policy.worst_case_wall_time_max_jitter_s == pytest.approx(7.95)
+
+    def test_wall_time_is_derived_from_non_default_policy(self) -> None:
+        """Not merely reproducing the defaults: a non-default policy, checked
+        by an independent closed-form calculation.
+
+        max_attempts=4, timeout_s=1.0, base=50, factor=3.0, cap=400, j=0:
+        base delays = min(50·3^0, 400)=50, min(150, 400)=150, min(450, 400)=400
+        -> attempts 4×1.0 = 4.0s + backoff (0.05+0.15+0.40) = 4.6s.
+        Independent closed form: base·(f^(n-1)-1)/(f-1) with the last term
+        capped: 50 + 150 + 400 = 600 ms -> 0.6s.
+        """
+        policy = RetryPolicy(
+            max_attempts=4,
+            timeout_s=1.0,
+            backoff_base_ms=50,
+            backoff_factor=3.0,
+            backoff_max_ms=400,
+            backoff_jitter=0.0,
+        )
+        assert policy.worst_case_wall_time_s == pytest.approx(4.6)
+        assert [policy.base_delay_ms(k) for k in (1, 2, 3)] == [50, 150, 400]
+
+    def test_cap_is_applied_before_jitter(self) -> None:
+        """Normative ordering (SPECS §6.1): cap bounds the base delay, then
+        jitter scales it — a capped delay can exceed backoff_max_ms.
+
+        jitter=0.5 on a capped 1000 ms delay -> ceiling 1500 ms. Under the
+        opposite ordering (cap-after-jitter) the ceiling would be 1000 ms.
+        """
+        policy = RetryPolicy(
+            max_attempts=2,  # one retry, so one capped delay
+            timeout_s=0.001,  # near-zero so the assertion isolates the backoff
+            backoff_base_ms=1000,
+            backoff_factor=1.0,
+            backoff_max_ms=1000,
+            backoff_jitter=0.5,
+        )
+        assert policy.base_delay_ms(1) == 1000
+        assert policy.worst_case_wall_time_s == pytest.approx(1.002)
+        assert policy.worst_case_wall_time_max_jitter_s == pytest.approx(1.502)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"max_attempts": 0}, "max_attempts"),
+            ({"timeout_s": 0}, "timeout_s"),
+            ({"backoff_base_ms": -1}, "backoff_base_ms"),
+            ({"backoff_factor": 0.5}, "backoff_factor"),
+            ({"backoff_max_ms": -1}, "backoff_max_ms"),
+            ({"backoff_jitter": 1.5}, "backoff_jitter"),
+        ],
+    )
+    def test_direct_construction_validates_ranges(self, kwargs: dict, message: str) -> None:
+        """Direct construction cannot bypass Settings' range checks."""
+        with pytest.raises(ValueError, match=message):
+            RetryPolicy(**kwargs)
+
+    def test_base_delay_is_one_indexed(self) -> None:
+        with pytest.raises(ValueError, match="1-indexed"):
+            RetryPolicy().base_delay_ms(0)
 
 
 class TestClassify:

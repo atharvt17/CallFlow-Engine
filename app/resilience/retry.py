@@ -29,8 +29,19 @@ class RetryPolicy:
     """Typed retry parameters (SPECS §6.1 defaults; SPECS §8 env wiring).
 
     ``timeout_s`` is the per-attempt deadline; ``backoff_*`` shape the delay
-    before retry ``k`` (1-indexed): ``base · factor^(k-1)`` capped at
-    ``backoff_max_ms``, scaled by uniform jitter in ``[1-j, 1+j]``.
+    before retry ``k`` (1-indexed), with **cap-before-jitter ordering**
+    (SPECS §6.1, normative)::
+
+        delay_k = min(base · factor^(k-1), backoff_max_ms) · U[1-j, 1+j]
+
+    The cap bounds the *base* delay only — at ``j=0.5`` a capped 1000 ms
+    delay may reach 1500 ms. The ordering is inert at the shipped defaults
+    (the 100/200 ms delays never reach the cap); it only matters when the
+    policy is overridden or ``max_attempts`` is raised. The two wall-time
+    properties below use the same ordering.
+
+    Range validation mirrors ``Settings`` (``__post_init__``) so a directly
+    constructed policy can never hold values the env layer would reject.
     """
 
     max_attempts: int = 3
@@ -39,6 +50,20 @@ class RetryPolicy:
     backoff_factor: float = 2.0
     backoff_max_ms: int = 1000
     backoff_jitter: float = 0.5
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError(f"max_attempts must be >= 1, got {self.max_attempts}")
+        if self.timeout_s <= 0:
+            raise ValueError(f"timeout_s must be > 0, got {self.timeout_s}")
+        if self.backoff_base_ms < 0:
+            raise ValueError(f"backoff_base_ms must be >= 0, got {self.backoff_base_ms}")
+        if self.backoff_factor < 1:
+            raise ValueError(f"backoff_factor must be >= 1, got {self.backoff_factor}")
+        if self.backoff_max_ms < 0:
+            raise ValueError(f"backoff_max_ms must be >= 0, got {self.backoff_max_ms}")
+        if not 0 <= self.backoff_jitter <= 1:
+            raise ValueError(f"backoff_jitter must be in [0, 1], got {self.backoff_jitter}")
 
     @classmethod
     def from_settings(cls, settings: Settings) -> RetryPolicy:
@@ -52,23 +77,46 @@ class RetryPolicy:
             backoff_jitter=settings.backoff_jitter,
         )
 
+    def base_delay_ms(self, retry_k: int) -> float:
+        """Capped, un-jittered delay before retry ``k`` (1-indexed).
+
+        ``min(backoff_base_ms · factor^(k-1), backoff_max_ms)`` — SPECS §6.1
+        with cap-before-jitter ordering. This is the single formula shared
+        by the wall-time properties and (M3-T03) the backoff calculator.
+        """
+        if retry_k < 1:
+            raise ValueError(f"retry_k is 1-indexed, got {retry_k}")
+        return min(
+            self.backoff_base_ms * self.backoff_factor ** (retry_k - 1),
+            self.backoff_max_ms,
+        )
+
+    def _total_backoff_s(self, *, max_jitter: bool) -> float:
+        multiplier = 1 + self.backoff_jitter if max_jitter else 1.0
+        return sum(
+            self.base_delay_ms(k) * multiplier / 1000.0
+            for k in range(1, self.max_attempts)
+        )
+
     @property
     def worst_case_wall_time_s(self) -> float:
         """Nominal worst-case logical-call wall time (SPECS §6.1: 7.8s).
 
         All attempts time out (``max_attempts × timeout_s``) plus the
-        un-jittered backoff sum before retries 1..max_attempts-1
-        (``base · (factor^(max_attempts-1) - 1) / (factor - 1)`` when
-        factor ≠ 1, else ``base · (max_attempts - 1)``), both capped by
-        ``backoff_max_ms`` per delay. At the shipped defaults this is
-        3×2.5 + 0.1 + 0.2 = 7.8s (≈7.95s at maximum +50% jitter).
+        un-jittered capped backoff sum before retries 1..max_attempts-1.
+        At the shipped defaults: 3×2.5 + 0.1 + 0.2 = 7.8s. Derived from the
+        policy fields (not hardcoded), so overrides are reflected exactly.
         """
-        attempts_cost = self.max_attempts * self.timeout_s
-        backoff_cost = 0.0
-        for k in range(1, self.max_attempts):
-            delay = min(self.backoff_base_ms * self.backoff_factor ** (k - 1), self.backoff_max_ms)
-            backoff_cost += delay / 1000.0
-        return attempts_cost + backoff_cost
+        return self.max_attempts * self.timeout_s + self._total_backoff_s(max_jitter=False)
+
+    @property
+    def worst_case_wall_time_max_jitter_s(self) -> float:
+        """Upper bound with every delay at maximum positive jitter.
+
+        ``max_attempts × timeout_s + Σ (capped delay · (1 + jitter))`` —
+        ≈7.95s at the shipped defaults (SPECS §6.1).
+        """
+        return self.max_attempts * self.timeout_s + self._total_backoff_s(max_jitter=True)
 
 
 class RetryDecision(Enum):
