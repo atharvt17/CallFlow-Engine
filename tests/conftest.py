@@ -40,8 +40,13 @@ def make_stack(tmp_path):
         mock_overrides: dict[str, float] | None = None,
         **inference_overrides: float | str,
     ) -> AsyncIterator[tuple[httpx.AsyncClient, Path]]:
+        # Deterministic default: no injected failures unless a test asks for
+        # them (the shipped 20% rate made happy-path asserts flaky — ~20% of
+        # runs the first POST landed failed_downstream). Callers override by
+        # passing their own failure_rate, e.g. {"failure_rate": 1.0}.
+        effective_mock_overrides = {"failure_rate": 0.0, **(mock_overrides or {})}
         mock_app = create_mock_app(
-            MockSettings(latency_mu=FAST_LATENCY_MU, **(mock_overrides or {}))
+            MockSettings(latency_mu=FAST_LATENCY_MU, **effective_mock_overrides)
         )
         db_path = tmp_path / "calls.db"
         settings = Settings(

@@ -147,7 +147,8 @@ async def test_no_silent_losses_under_transient_failures(make_stack) -> None:
     """25 events at the shipped 20% failure rate -> every one terminal."""
     n = 25
     event_ids = [str(uuid4()) for _ in range(n)]
-    async with make_stack() as (client, db_path):
+    # Explicit 20% (Appendix B default) — the fixture now defaults to 0%.
+    async with make_stack(mock_overrides={"failure_rate": 0.20}) as (client, db_path):
         for event_id in event_ids:
             resp = await client.post("/calls", json=event_payload(event_id))
             assert resp.status_code == 200, "failures are terminal outcomes, not HTTP errors"
