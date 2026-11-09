@@ -8,13 +8,65 @@ client can produce (see app/pipeline/http_client.py mapping).
 
 from __future__ import annotations
 
+import asyncio
 import random
 
 import pytest
 
 from app.config import Settings
+from app.metrics import Metrics
 from app.pipeline.base import PipelineResult
-from app.resilience.retry import RetryDecision, RetryPolicy, backoff_delay, classify
+from app.resilience.retry import (
+    AttemptRecord,
+    RetryDecision,
+    RetryOutcome,
+    RetryPolicy,
+    backoff_delay,
+    classify,
+    execute_with_retry,
+)
+
+
+class FakeSleeper:
+    """Records sleeps instead of performing them (M3-T05: zero real sleeping)."""
+
+    def __init__(self) -> None:
+        self.sleeps: list[float] = []
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+
+
+class FakeClock:
+    """Monotonic fake clock; each call advances by a fixed step (ms→s)."""
+
+    def __init__(self, step_s: float = 0.001) -> None:
+        self.now = 0.0
+        self.step_s = step_s
+
+    def __call__(self) -> float:
+        self.now += self.step_s
+        return self.now
+
+
+def _fail(reason: str = "downstream_timeout", status: int | None = 503) -> PipelineResult:
+    return PipelineResult(ok=False, reason=reason, http_status=status, latency_ms=250.0)
+
+
+def _ok() -> PipelineResult:
+    return PipelineResult(ok=True, http_status=200, latency_ms=300.0)
+
+
+class _ScriptedBackend:
+    """Returns scripted results in order; counts calls."""
+
+    def __init__(self, results: list[PipelineResult]) -> None:
+        self._results = list(results)
+        self.calls = 0
+
+    async def __call__(self) -> PipelineResult:
+        self.calls += 1
+        return self._results.pop(0) if self._results else _fail()
 
 
 class TestRetryPolicyDefaults:
@@ -223,3 +275,146 @@ class TestClassify:
     def test_failure_without_any_signal_stops(self) -> None:
         # Defensive branch: no reason, no status — must not loop forever.
         assert classify(PipelineResult(ok=False)) is RetryDecision.STOP
+
+
+class TestExecuteWithRetry:
+    """M3-T04/T05 acceptance: deterministic executor, zero real sleeps."""
+
+    async def test_success_first_attempt_no_sleep(self) -> None:
+        backend = _ScriptedBackend([_ok()])
+        sleeper = FakeSleeper()
+        outcome = await execute_with_retry(backend, RetryPolicy(), sleeper=sleeper)
+        assert isinstance(outcome, RetryOutcome)
+        assert outcome.ok and outcome.attempts == 1 and outcome.retry_count == 0
+        assert sleeper.sleeps == []
+        assert backend.calls == 1
+        assert isinstance(outcome.records[0], AttemptRecord)
+        assert outcome.records[0].delay_before_ms == 0.0
+
+    async def test_retries_on_spec_503_then_succeeds(self) -> None:
+        backend = _ScriptedBackend([_fail(), _ok()])
+        sleeper = FakeSleeper()
+        policy = RetryPolicy(backoff_jitter=0.0)
+        outcome = await execute_with_retry(backend, policy, sleeper=sleeper)
+        assert outcome.ok and outcome.attempts == 2 and outcome.retry_count == 1
+        assert sleeper.sleeps == [0.1]  # exactly one 100ms backoff (j=0)
+        assert backend.calls == 2
+
+    async def test_retries_on_timeout_and_connection_error(self) -> None:
+        for reason in ("timeout", "connection_error"):
+            backend = _ScriptedBackend([_fail(reason=reason, status=None), _ok()])
+            sleeper = FakeSleeper()
+            outcome = await execute_with_retry(backend, RetryPolicy(), sleeper=sleeper)
+            assert outcome.ok and outcome.attempts == 2, reason
+
+    async def test_no_retry_on_4xx(self) -> None:
+        backend = _ScriptedBackend([_fail(reason="non_retryable_error", status=400)])
+        sleeper = FakeSleeper()
+        outcome = await execute_with_retry(backend, RetryPolicy(), sleeper=sleeper)
+        assert not outcome.ok and outcome.attempts == 1
+        assert sleeper.sleeps == []
+        assert backend.calls == 1
+
+    async def test_max_attempts_exhausted(self) -> None:
+        backend = _ScriptedBackend([_fail(), _fail(), _fail()])
+        sleeper = FakeSleeper()
+        policy = RetryPolicy(backoff_jitter=0.0)
+        outcome = await execute_with_retry(backend, policy, sleeper=sleeper)
+        assert not outcome.ok
+        assert outcome.attempts == 3 and outcome.retry_count == 2
+        assert sleeper.sleeps == [0.1, 0.2]  # 3 attempts → 2 sleeps
+        assert backend.calls == 3
+
+    async def test_per_attempt_timeout_is_enforced(self) -> None:
+        async def hanging() -> PipelineResult:
+            await asyncio.sleep(10)  # would blow the test budget if not cut off
+            return _ok()
+
+        policy = RetryPolicy(max_attempts=1, timeout_s=0.01)
+        outcome = await execute_with_retry(hanging, policy, sleeper=FakeSleeper())
+        assert not outcome.ok
+        assert outcome.result.reason == "timeout"
+        assert outcome.records[0].timed_out is True
+
+    async def test_unexpected_exception_is_retryable_connection_error(self) -> None:
+        calls = {"n": 0}
+
+        async def flaky() -> PipelineResult:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("boom")
+            return _ok()
+
+        sleeper = FakeSleeper()
+        outcome = await execute_with_retry(flaky, RetryPolicy(), sleeper=sleeper)
+        assert outcome.ok and outcome.attempts == 2
+        assert outcome.records[0].result.reason == "connection_error"
+
+    async def test_delay_before_recorded_on_records(self) -> None:
+        backend = _ScriptedBackend([_fail(), _fail(), _ok()])
+        policy = RetryPolicy(backoff_jitter=0.0)
+        outcome = await execute_with_retry(backend, policy, sleeper=FakeSleeper())
+        assert [r.delay_before_ms for r in outcome.records] == [0.0, 100.0, 200.0]
+
+    async def test_clock_is_injectable(self) -> None:
+        # No backend-reported latency → the executor measures with the clock.
+        backend = _ScriptedBackend([PipelineResult(ok=True, http_status=200)])
+        clock = FakeClock(step_s=1.0)
+        outcome = await execute_with_retry(
+            backend, RetryPolicy(), sleeper=FakeSleeper(), clock=clock
+        )
+        # One start + one end reading = 1 simulated second.
+        assert outcome.records[0].latency_ms == pytest.approx(1000.0)
+
+    async def test_backend_reported_latency_takes_precedence(self) -> None:
+        backend = _ScriptedBackend([_ok()])
+        clock = FakeClock(step_s=1.0)
+        outcome = await execute_with_retry(
+            backend, RetryPolicy(), sleeper=FakeSleeper(), clock=clock
+        )
+        assert outcome.records[0].latency_ms == 300.0
+
+    async def test_wall_time_within_7_8s_bound(self) -> None:
+        """All attempts' timeouts + the policy's backoff sum ≤ the bound."""
+        policy = RetryPolicy()
+        assert policy.worst_case_wall_time_s <= 7.8
+        assert policy.worst_case_wall_time_max_jitter_s <= 7.95
+
+
+class TestRetryMetrics:
+    """M3-T06 acceptance: metric values match the attempt logs."""
+
+    def _values(self, metrics: Metrics) -> dict[str, float]:
+        body = metrics.render()[0].decode()
+        return {
+            line.split("{")[0]: float(line.rsplit(" ", 1)[1])
+            for line in body.splitlines()
+            if line and not line.startswith("#")
+        }
+
+    async def test_three_attempt_exhaustion_counts(self) -> None:
+        metrics = Metrics()
+        backend = _ScriptedBackend([_fail(), _fail(), _fail()])
+        outcome = await execute_with_retry(
+            backend, RetryPolicy(), sleeper=FakeSleeper(), metrics=metrics
+        )
+        assert outcome.attempts == 3
+        body = metrics.render()[0].decode()
+        assert 'pipeline_attempts_total{result="error"} 3.0' in body
+        assert "retries_total 2.0" in body
+        assert "pipeline_attempt_latency_ms_count 3.0" in body
+
+    async def test_success_then_stop_metrics(self) -> None:
+        metrics = Metrics()
+        backend = _ScriptedBackend([_ok()])
+        await execute_with_retry(backend, RetryPolicy(), sleeper=FakeSleeper(), metrics=metrics)
+        body = metrics.render()[0].decode()
+        assert 'pipeline_attempts_total{result="success"} 1.0' in body
+        assert "retries_total 0.0" in body
+
+    async def test_metrics_hooks_optional(self) -> None:
+        """No metrics bundle must never break the executor."""
+        outcome = await execute_with_retry(
+            _ScriptedBackend([_ok()]), RetryPolicy(), sleeper=FakeSleeper()
+        )
+        assert outcome.ok

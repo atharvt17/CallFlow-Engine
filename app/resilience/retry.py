@@ -17,16 +17,30 @@ attempt. It is table-driven and side-effect free; its cases are asserted by
 :func:`backoff_delay` is the deterministic-under-seed delay calculator
 (M3-T03): the capped exponential base from :meth:`RetryPolicy.base_delay_ms`
 scaled by injected uniform jitter.
+
+:func:`execute_with_retry` is the async attempt engine (M3-T04): it drives
+any ``op`` (one downstream attempt) up to ``max_attempts`` times, wrapping
+each attempt in the per-attempt timeout, sleeping the backoff between
+attempts, and stopping early on a non-retryable result. Sleeper, clock, and
+RNG are injected, so unit tests run with no real sleeping.
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import random
-from dataclasses import dataclass
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from enum import Enum
+from typing import Protocol
 
 from app.config import Settings
+from app.metrics import Metrics
 from app.pipeline.base import PipelineResult
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -178,3 +192,153 @@ def classify(result: PipelineResult) -> RetryDecision:
         return RetryDecision.RETRY
     # Defensive: a failure with no retryable signal at all must not loop.
     return RetryDecision.STOP
+
+
+# --- M3-T04: the async attempt engine ---------------------------------------
+
+
+class Sleeper(Protocol):
+    """Awaitable delay seam — production sleeps, tests record."""
+
+    async def sleep(self, seconds: float) -> None: ...
+
+
+class AsyncioSleeper:
+    """Production sleeper (real time)."""
+
+    async def sleep(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
+
+
+@dataclass(frozen=True)
+class AttemptRecord:
+    """One attempt's outcome, as the executor observed it.
+
+    ``latency_ms`` is the backend-reported latency when available (HTTP
+    success/failure bodies carry it) and the executor-measured wall time
+    otherwise (timeouts, inline backends). ``delay_before_ms`` is the backoff
+    actually slept before this attempt (0 for the first).
+    """
+
+    attempt: int  # 1-indexed
+    result: PipelineResult
+    latency_ms: float | None
+    delay_before_ms: float
+    timed_out: bool = False
+
+
+@dataclass(frozen=True)
+class RetryOutcome:
+    """Final outcome of one logical call (the whole retry sequence)."""
+
+    result: PipelineResult
+    attempts: int
+    records: tuple[AttemptRecord, ...] = field(default_factory=tuple)
+
+    @property
+    def ok(self) -> bool:
+        return self.result.ok
+
+    @property
+    def retry_count(self) -> int:
+        """Retries after the first attempt (``attempts - 1``, SPECS §3)."""
+        return max(0, self.attempts - 1)
+
+
+async def execute_with_retry(
+    op: Callable[[], Awaitable[PipelineResult]],
+    policy: RetryPolicy,
+    *,
+    sleeper: Sleeper | None = None,
+    clock: Callable[[], float] | None = None,
+    rng: random.Random | None = None,
+    metrics: Metrics | None = None,
+    on_attempt: Callable[[AttemptRecord], None] | None = None,
+) -> RetryOutcome:
+    """Run ``op`` up to ``policy.max_attempts`` times (SPECS §6.1, M3-T04).
+
+    Each attempt is wrapped in ``asyncio.wait_for`` with the policy's
+    per-attempt timeout; a timeout becomes a ``reason="timeout"`` result.
+    Between attempts the executor sleeps ``backoff_delay(k, policy, rng)``.
+    Stops early on success or a non-retryable result.
+
+    An unexpected exception from ``op`` (the backend protocol promises none)
+    is treated as a retryable ``connection_error`` so accounting never loses
+    the logical call; cancellation still propagates (``BaseException``).
+
+    Metrics (M3-T06), when supplied, are attempt-level only — they never feed
+    the breaker window (SPECS §6.2): each attempt increments
+    ``pipeline_attempts_total{result}`` and observes
+    ``pipeline_attempt_latency_ms``; each scheduled retry increments
+    ``retries_total``.
+    """
+    sleeper = sleeper if sleeper is not None else AsyncioSleeper()
+    clock = clock if clock is not None else time.perf_counter
+    rng = rng if rng is not None else random.Random()
+
+    records: list[AttemptRecord] = []
+    delay_before_ms = 0.0
+
+    for attempt in range(1, policy.max_attempts + 1):
+        started = clock()
+        timed_out = False
+        try:
+            result = await asyncio.wait_for(op(), timeout=policy.timeout_s)
+        except TimeoutError:
+            timed_out = True
+            result = PipelineResult(
+                ok=False, reason="timeout", latency_ms=policy.timeout_s * 1000
+            )
+        except Exception as exc:  # noqa: BLE001 - protocol says backends don't raise
+            logger.warning(
+                "pipeline attempt raised unexpectedly",
+                extra={"json_fields": {"attempt": attempt, "error": str(exc)}},
+            )
+            result = PipelineResult(ok=False, reason="connection_error")
+        measured_ms = (clock() - started) * 1000
+        latency_ms = result.latency_ms if result.latency_ms is not None else measured_ms
+
+        record = AttemptRecord(
+            attempt=attempt,
+            result=result,
+            latency_ms=latency_ms,
+            delay_before_ms=delay_before_ms,
+            timed_out=timed_out,
+        )
+        records.append(record)
+
+        # Attempt-level observability (never feeds breaker statistics).
+        if metrics is not None:
+            if result.ok:
+                outcome_label = "success"
+            elif result.reason == "timeout":
+                outcome_label = "timeout"
+            else:
+                outcome_label = "error"
+            metrics.pipeline_attempts_total.labels(result=outcome_label).inc()
+            metrics.pipeline_attempt_latency_ms.observe(latency_ms)
+        if on_attempt is not None:
+            on_attempt(record)
+
+        if classify(result) is RetryDecision.STOP:
+            return RetryOutcome(result=result, attempts=attempt, records=tuple(records))
+        if attempt == policy.max_attempts:
+            break
+
+        delay_before_ms = backoff_delay(attempt, policy, rng)
+        if metrics is not None:
+            metrics.retries_total.inc()
+        logger.info(
+            "retry_scheduled",
+            extra={
+                "json_fields": {
+                    "attempt": attempt,
+                    "delay_ms": round(delay_before_ms, 2),
+                    "reason": result.reason,
+                }
+            },
+        )
+        await sleeper.sleep(delay_before_ms / 1000)
+
+    return RetryOutcome(result=records[-1].result, attempts=len(records), records=tuple(records))
+
