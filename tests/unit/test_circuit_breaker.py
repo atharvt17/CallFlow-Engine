@@ -1,17 +1,26 @@
-"""Circuit-breaker unit tests (M3-T07, M3-T08; SPECS §6.2, §11).
+"""Circuit-breaker unit tests (M3-T07–T09; SPECS §6.2, §11).
 
 Deterministic: a fake clock drives cooldown, and outcomes are recorded
 directly — no sleeping, no backend. The accounting unit under test is the
 **completed logical call**, so every ``record_logical_outcome`` here
 represents one whole retry sequence.
+
+M3-T09 adds the HALF_OPEN probe-permit lifecycle: one permit = one complete
+logical call (its whole retry sequence), acquired before dispatch, held
+through every attempt, released exactly once, never leaked by cancellation
+or unexpected exceptions, and never counted per attempt.
 """
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from app.config import Settings
+from app.pipeline.base import PipelineResult
 from app.resilience.circuit_breaker import CircuitBreaker, CircuitState
+from app.resilience.retry import RetryPolicy, execute_with_retry
 
 
 class FakeClock:
@@ -263,6 +272,259 @@ class TestOpenGate:
         breaker.record_logical_outcome(success=True)  # late result
         assert breaker.state is CircuitState.OPEN
         assert breaker.window_samples == samples
+
+
+class FakeSleeper:
+    def __init__(self) -> None:
+        self.sleeps: list[float] = []
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+
+
+def _ok() -> PipelineResult:
+    return PipelineResult(ok=True, http_status=200, latency_ms=300.0)
+
+
+def _fail() -> PipelineResult:
+    return PipelineResult(
+        ok=False, reason="downstream_timeout", http_status=503, latency_ms=250.0
+    )
+
+
+class ScriptedBackend:
+    """One downstream attempt per call; returns scripted results in order."""
+
+    def __init__(self, results: list[PipelineResult]) -> None:
+        self._results = list(results)
+        self.calls = 0
+
+    async def __call__(self) -> PipelineResult:
+        self.calls += 1
+        return self._results.pop(0) if self._results else _fail()
+
+
+async def logical_call(
+    breaker: CircuitBreaker,
+    op,
+    *,
+    policy: RetryPolicy | None = None,
+    sleeper=None,
+    on_attempt=None,
+):
+    """The M3-T14 decorator shape, in miniature.
+
+    One permit is acquired BEFORE ``execute_with_retry`` and held across the
+    whole retry sequence. ``with permit`` is the production safety net:
+    cancellation and unexpected exceptions release it without recording
+    probe evidence; the normal path calls ``finish`` exactly once.
+    """
+    permit = breaker.acquire_probe()
+    if permit is None:
+        return None
+    with permit:
+        outcome = await execute_with_retry(
+            op,
+            policy or RetryPolicy(backoff_jitter=0.0),
+            sleeper=sleeper or FakeSleeper(),
+            on_attempt=on_attempt,
+        )
+        permit.finish(success=outcome.ok)
+    return outcome
+
+
+class TestHalfOpenProbePermits:
+    """M3-T09: a probe permit is one complete logical call, never one attempt."""
+
+    def _half_open(self, clock: FakeClock, **overrides) -> CircuitBreaker:
+        breaker = make_breaker(clock=clock, **overrides)
+        trip_open(breaker, clock)
+        clock.advance(5.0)
+        assert breaker.state is CircuitState.HALF_OPEN
+        return breaker
+
+    def test_admits_up_to_configured_budget(self) -> None:
+        clock = FakeClock()
+        breaker = self._half_open(clock, half_open_probes=3)
+        permits = [breaker.acquire_probe() for _ in range(3)]
+        assert all(permit is not None and permit.is_probe for permit in permits)
+        assert breaker.half_open_in_flight == 3
+
+    def test_rejects_when_budget_exhausted(self) -> None:
+        clock = FakeClock()
+        breaker = self._half_open(clock, half_open_probes=3)
+        for _ in range(3):
+            assert breaker.acquire_probe() is not None
+        assert breaker.acquire_probe() is None
+        assert breaker.half_open_in_flight == 3
+
+    def test_open_breaker_refuses_permit(self) -> None:
+        clock = FakeClock()
+        breaker = make_breaker(clock=clock)
+        trip_open(breaker, clock)
+        assert breaker.acquire_probe() is None
+
+    def test_permit_release_after_success_frees_budget_only(self) -> None:
+        clock = FakeClock()
+        breaker = self._half_open(clock, half_open_probes=3, half_open_success=2)
+        permit = breaker.acquire_probe()
+        assert breaker.half_open_in_flight == 1
+        permit.finish(success=True)
+        assert permit.released is True
+        assert breaker.half_open_in_flight == 0
+        # One success is not enough to close (threshold 2) …
+        assert breaker.state is CircuitState.HALF_OPEN
+        # … and the freed slot is reusable.
+        assert breaker.acquire_probe() is not None
+
+    def test_permit_release_after_failure_reopens(self) -> None:
+        clock = FakeClock()
+        breaker = self._half_open(clock)
+        permit = breaker.acquire_probe()
+        permit.finish(success=False)
+        assert breaker.half_open_in_flight == 0
+        assert breaker.state is CircuitState.OPEN
+        assert breaker.opened_at == clock.now
+
+    def test_release_is_idempotent(self) -> None:
+        """Releasing twice must not over-restore the budget or double-count
+        evidence (defensive: ``with permit`` and an explicit release can both
+        fire)."""
+        clock = FakeClock()
+        breaker = self._half_open(clock, half_open_success=2)
+        permit = breaker.acquire_probe()
+        permit.finish(success=True)
+        permit.finish(success=True)
+        permit.release()
+        assert breaker.half_open_in_flight == 0
+        assert breaker.state is CircuitState.HALF_OPEN  # still only 1 success
+
+    def test_context_manager_releases_without_evidence(self) -> None:
+        clock = FakeClock()
+        breaker = self._half_open(clock)
+        permit = breaker.acquire_probe()
+        with permit:
+            assert breaker.half_open_in_flight == 1
+        assert permit.released is True
+        assert breaker.half_open_in_flight == 0
+        assert breaker.state is CircuitState.HALF_OPEN  # no probe evidence
+
+    def test_plain_release_records_no_probe_evidence(self) -> None:
+        clock = FakeClock()
+        breaker = self._half_open(clock)
+        permit = breaker.acquire_probe()
+        permit.release()
+        assert permit.released is True
+        assert breaker.half_open_in_flight == 0
+        assert breaker.state is CircuitState.HALF_OPEN
+
+    def test_two_successful_probes_close(self) -> None:
+        clock = FakeClock()
+        breaker = self._half_open(clock, half_open_success=2)
+        for _ in range(2):
+            permit = breaker.acquire_probe()
+            assert permit is not None
+            permit.finish(success=True)
+        assert breaker.state is CircuitState.CLOSED
+        assert breaker.window_samples == 0  # reset on close
+
+    def test_closed_breaker_passthrough_permit_is_not_a_probe(self) -> None:
+        breaker = make_breaker()
+        permit = breaker.acquire_probe()
+        assert permit is not None
+        assert permit.is_probe is False
+        assert breaker.half_open_in_flight == 0
+
+    async def test_concurrent_admission_bounded_by_budget(self) -> None:
+        clock = FakeClock()
+        breaker = self._half_open(clock, half_open_probes=3)
+        gate = asyncio.Event()
+
+        async def op() -> PipelineResult:
+            await gate.wait()
+            return _ok()
+
+        tasks = [asyncio.create_task(logical_call(breaker, op)) for _ in range(5)]
+        await asyncio.sleep(0)
+        assert breaker.half_open_in_flight == 3
+        gate.set()
+        results = await asyncio.gather(*tasks)
+        admitted = [r for r in results if r is not None]
+        rejected = [r for r in results if r is None]
+        assert len(admitted) == 3
+        assert len(rejected) == 2
+        assert breaker.half_open_in_flight == 0
+
+    async def test_retries_consume_one_permit(self) -> None:
+        """A probe that retries twice still holds exactly one permit, and its
+        final outcome (success) is what counts — attempts never re-acquire."""
+        clock = FakeClock()
+        breaker = self._half_open(clock)
+        backend = ScriptedBackend([_fail(), _fail(), _ok()])
+        in_flight_samples: list[int] = []
+        outcome = await logical_call(
+            breaker, backend, on_attempt=lambda _rec: in_flight_samples.append(
+                breaker.half_open_in_flight
+            )
+        )
+        assert outcome is not None
+        assert outcome.attempts == 3
+        assert backend.calls == 3
+        assert in_flight_samples == [1, 1, 1]
+        assert breaker.state is CircuitState.HALF_OPEN  # one successful probe
+        assert breaker.half_open_in_flight == 0
+
+    async def test_failed_retry_sequence_counts_as_one_failed_probe(self) -> None:
+        clock = FakeClock()
+        breaker = self._half_open(clock)
+        backend = ScriptedBackend([_fail(), _fail(), _fail()])
+        outcome = await logical_call(breaker, backend)
+        assert outcome is not None
+        assert outcome.attempts == 3
+        assert breaker.state is CircuitState.OPEN
+        assert breaker.half_open_in_flight == 0
+
+    async def test_cancellation_releases_permit(self) -> None:
+        clock = FakeClock()
+        breaker = self._half_open(clock, half_open_probes=3)
+        started = asyncio.Event()
+
+        async def op() -> PipelineResult:
+            started.set()
+            await asyncio.Event().wait()
+            return _ok()
+
+        task = asyncio.create_task(logical_call(breaker, op))
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        assert breaker.half_open_in_flight == 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2.0)
+        assert breaker.half_open_in_flight == 0
+        assert breaker.state is CircuitState.HALF_OPEN  # cancellation is not evidence
+
+    async def test_unexpected_exception_releases_permit(self) -> None:
+        clock = FakeClock()
+        breaker = self._half_open(clock)
+
+        class ExplodingSleeper:
+            async def sleep(self, seconds: float) -> None:
+                raise RuntimeError("sleeper exploded")
+
+        with pytest.raises(RuntimeError):
+            await logical_call(
+                breaker, ScriptedBackend([_fail()]), sleeper=ExplodingSleeper()
+            )
+        assert breaker.half_open_in_flight == 0
+        assert breaker.state is CircuitState.HALF_OPEN  # no leaked evidence
+
+    async def test_closed_retry_sequence_records_exactly_one_window_entry(self) -> None:
+        breaker = make_breaker()
+        backend = ScriptedBackend([_fail(), _fail(), _ok()])
+        outcome = await logical_call(breaker, backend)
+        assert outcome is not None and outcome.attempts == 3
+        assert breaker.window_samples == 1  # attempts never inflate the window
+        assert breaker.window_failures == 0
 
 
 class TestTransitionHook:
