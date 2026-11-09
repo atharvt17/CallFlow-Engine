@@ -1,7 +1,11 @@
 PLAN.MD
+PLAN.md
 SPECS.MD
+SPECS.md
 TASKS.MD
+TASKS.md
 CHALLENGE.MD
+CHALLENGE.md
 *.pdf
 
 # --- Agent activity changelog (local-only; never commit or push) ---
