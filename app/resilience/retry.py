@@ -13,10 +13,15 @@ is the only deadline in Round 1 (SPECS §13 decision).
 :class:`~app.pipeline.base.PipelineResult`: which outcomes warrant another
 attempt. It is table-driven and side-effect free; its cases are asserted by
 ``tests/unit/test_retry.py`` (M3-T05).
+
+:func:`backoff_delay` is the deterministic-under-seed delay calculator
+(M3-T03): the capped exponential base from :meth:`RetryPolicy.base_delay_ms`
+scaled by injected uniform jitter.
 """
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from enum import Enum
 
@@ -117,6 +122,25 @@ class RetryPolicy:
         ≈7.95s at the shipped defaults (SPECS §6.1).
         """
         return self.max_attempts * self.timeout_s + self._total_backoff_s(max_jitter=True)
+
+
+def backoff_delay(retry_k: int, policy: RetryPolicy, rng: random.Random) -> float:
+    """Delay in **milliseconds** before retry ``retry_k`` (1-indexed).
+
+    ``delay = base_delay_ms(k) · U[1−j, 1+j]`` — the capped exponential base
+    (SPECS §6.1, cap-before-jitter) perturbed by uniform jitter. At the
+    shipped defaults and ``j=0`` the sequence is exactly 100, 200 ms; at
+    ``j=0.5`` each delay lies within ±50% of its base, and a capped delay
+    may exceed ``backoff_max_ms`` by the jitter factor (see
+    :meth:`RetryPolicy.base_delay_ms`).
+
+    ``rng`` is injected (``random.Random``) so tests are deterministic under
+    a seed and the executor owns the random stream — this function is pure
+    with respect to everything else.
+    """
+    base = policy.base_delay_ms(retry_k)
+    jitter = policy.backoff_jitter
+    return base * rng.uniform(1 - jitter, 1 + jitter)
 
 
 class RetryDecision(Enum):

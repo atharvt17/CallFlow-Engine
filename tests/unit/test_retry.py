@@ -8,11 +8,13 @@ client can produce (see app/pipeline/http_client.py mapping).
 
 from __future__ import annotations
 
+import random
+
 import pytest
 
 from app.config import Settings
 from app.pipeline.base import PipelineResult
-from app.resilience.retry import RetryDecision, RetryPolicy, classify
+from app.resilience.retry import RetryDecision, RetryPolicy, backoff_delay, classify
 
 
 class TestRetryPolicyDefaults:
@@ -123,6 +125,62 @@ class TestRetryPolicyDefaults:
     def test_base_delay_is_one_indexed(self) -> None:
         with pytest.raises(ValueError, match="1-indexed"):
             RetryPolicy().base_delay_ms(0)
+
+
+class TestBackoffDelay:
+    """M3-T03 acceptance: jittered, capped, deterministic-under-seed delays."""
+
+    def test_jitter_zero_sequence_is_exactly_100_200(self) -> None:
+        policy = RetryPolicy(backoff_jitter=0.0)
+        rng = random.Random(42)
+        assert [backoff_delay(k, policy, rng) for k in (1, 2)] == [100.0, 200.0]
+
+    def test_cap_holds_for_higher_attempts(self) -> None:
+        """Exponential growth stops at backoff_max_ms (j=0 isolates the cap)."""
+        policy = RetryPolicy(max_attempts=8, backoff_jitter=0.0)
+        delays = [backoff_delay(k, policy, random.Random(0)) for k in range(1, 8)]
+        assert delays == [100.0, 200.0, 400.0, 800.0, 1000.0, 1000.0, 1000.0]
+
+    def test_jitter_stays_within_bounds(self) -> None:
+        policy = RetryPolicy(backoff_jitter=0.5)
+        rng = random.Random(7)
+        for k in (1, 2, 3, 4, 5):
+            base = policy.base_delay_ms(k)
+            for _ in range(200):
+                delay = backoff_delay(k, policy, rng)
+                assert 0.5 * base <= delay <= 1.5 * base
+
+    def test_jitter_actually_varies(self) -> None:
+        policy = RetryPolicy(backoff_jitter=0.5)
+        rng = random.Random(11)
+        draws = {backoff_delay(1, policy, rng) for _ in range(50)}
+        assert len(draws) > 40, "jitter must perturb each draw"
+
+    def test_deterministic_under_seed(self) -> None:
+        policy = RetryPolicy()
+        first = [backoff_delay(k, policy, random.Random(1234)) for k in (1, 2)]
+        second = [backoff_delay(k, policy, random.Random(1234)) for k in (1, 2)]
+        assert first == second
+
+    def test_capped_delay_can_exceed_cap_by_jitter(self) -> None:
+        """Cap-before-jitter ordering (SPECS §6.1): at a capped delay the
+        jittered result may exceed backoff_max_ms."""
+        policy = RetryPolicy(max_attempts=2, backoff_base_ms=1000, backoff_factor=1.0,
+                             backoff_max_ms=1000, backoff_jitter=0.5)
+        rng = random.Random(0)
+        draws = [backoff_delay(1, policy, rng) for _ in range(200)]
+        assert max(draws) > 1000.0
+        assert max(draws) <= 1500.0
+
+    def test_retry_k_is_one_indexed(self) -> None:
+        with pytest.raises(ValueError, match="1-indexed"):
+            backoff_delay(0, RetryPolicy(), random.Random(0))
+
+    def test_no_jitter_uses_uniform_call_but_is_exact(self) -> None:
+        """j=0 must return the base exactly, even through rng.uniform(1,1)."""
+        policy = RetryPolicy(backoff_jitter=0.0)
+        for k in (1, 2, 3):
+            assert backoff_delay(k, policy, random.Random(k)) == policy.base_delay_ms(k)
 
 
 class TestClassify:
