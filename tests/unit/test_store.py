@@ -123,3 +123,33 @@ def test_init_db_is_idempotent_on_existing_schema(tmp_db) -> None:
         )
     }
     assert {"call_events", "dead_letter", "idx_call_events_status", "idx_dead_letter_status"} <= names
+
+
+def test_init_db_rejects_incompatible_existing_schema(tmp_path) -> None:
+    """Both tables present does NOT imply a valid schema: column mismatch fails loudly."""
+    conn = store.connect(tmp_path / "legacy.db")
+    try:
+        conn.execute("CREATE TABLE call_events (event_id TEXT PRIMARY KEY)")  # legacy/foreign schema
+        conn.execute("CREATE TABLE dead_letter (id INTEGER PRIMARY KEY)")
+        with pytest.raises(RuntimeError, match="schema is incompatible") as excinfo:
+            store.init_db(conn)
+        message = str(excinfo.value)
+        assert "input_outcome" in message  # names concrete missing columns
+        assert "first_failed_at" in message
+    finally:
+        conn.close()
+
+
+def test_input_outcome_column_is_not_null(tmp_db) -> None:
+    """SPECS §7: input_outcome TEXT NOT NULL (Appendix A mandates `outcome`)."""
+    columns = {
+        row["name"]: row["notnull"]
+        for row in tmp_db.execute("PRAGMA table_info(call_events)")
+    }
+    assert columns["input_outcome"] == 1  # NOT NULL constraint present
+    with pytest.raises(sqlite3.IntegrityError):
+        tmp_db.execute(
+            "INSERT INTO call_events (event_id, campaign_id, borrower_bucket, timestamp,"
+            " input_outcome, event_json, status, created_at, updated_at)"
+            " VALUES ('x1', 'c', '0-30 DPD', 't', NULL, '{}', 'processing', 'a', 'a')"
+        )

@@ -8,8 +8,9 @@ illustrative sample ids are not conformant; SPECS §3 mandates UUID parsing).
 
 ``retry_count`` is accepted for Appendix A compatibility but is **never
 authoritative**: the service computes its own attempt accounting
-(``retry_count = attempts - 1``); incoming values are preserved as audit data
-only. ``timestamp`` is parsed into a tz-aware datetime and stored in
+(``retry_count = attempts - 1``). An incoming value survives only inside the
+stored ``event_json`` (audit); the database's ``retry_count`` column is always
+service-owned. ``timestamp`` is parsed into a tz-aware datetime and stored in
 normalized RFC3339 (``isoformat``) — the instant is preserved.
 """
 

@@ -67,6 +67,69 @@ CREATE TABLE dead_letter (
 CREATE INDEX idx_dead_letter_status ON dead_letter(status);
 """
 
+# Expected column names per table (derived from the SPECS §7 DDL above); used
+# to detect incompatible pre-existing stores instead of blindly trusting that
+# the presence of both tables implies a valid schema.
+_EXPECTED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "call_events": (
+        "event_id",
+        "campaign_id",
+        "borrower_bucket",
+        "product_type",
+        "timestamp",
+        "call_duration_s",
+        "input_outcome",
+        "event_json",
+        "status",
+        "outcome",
+        "attempts",
+        "retry_count",
+        "pipeline_latency_ms",
+        "e2e_latency_ms",
+        "failure_reason",
+        "dlq_id",
+        "created_at",
+        "updated_at",
+    ),
+    "dead_letter": (
+        "id",
+        "event_id",
+        "event_json",
+        "reason",
+        "attempts",
+        "retry_count",
+        "first_failed_at",
+        "last_failed_at",
+        "status",
+        "replayed_at",
+        "replay_outcome",
+        "replay_event_id",
+    ),
+}
+
+
+def _validate_existing_schema(conn: sqlite3.Connection) -> None:
+    """Raise with a precise diff when an existing store's schema doesn't match.
+
+    All tables are validated so the operator sees the complete mismatch in
+    one error instead of fixing tables one raise at a time.
+    """
+    problems: list[str] = []
+    for table, expected in _EXPECTED_COLUMNS.items():
+        actual = tuple(row["name"] for row in conn.execute(f"PRAGMA table_info({table})"))
+        if set(actual) != set(expected):
+            missing = sorted(set(expected) - set(actual))
+            extra = sorted(set(actual) - set(expected))
+            problems.append(
+                f"{table!r}: missing columns {missing}, unexpected columns {extra}"
+            )
+    if problems:
+        raise RuntimeError(
+            "existing store schema is incompatible with the SPECS §7 DDL — "
+            + "; ".join(problems)
+            + ". A schema migration is out of Round 1 scope — move or recreate the store."
+        )
+
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
     """Open (and auto-create) the store at ``db_path`` with SPECS §7 pragmas."""
@@ -81,12 +144,14 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """Create the SPECS §7 schema; a no-op when it already exists (restart safety).
+    """Create the SPECS §7 schema; validated no-op when it already exists.
 
     The DDL text stays verbatim (no ``IF NOT EXISTS``); instead, boot against
-    an existing store skips the script when both tables are present. A partial
-    schema (one table, not the other) is left to fail loudly — that is a
-    corrupted store, not a migration case in Round 1.
+    an existing store skips the script **only after** validating that the
+    existing tables match the expected SPECS §7 columns — the mere presence
+    of both tables is not proof of a compatible schema. A partial schema (one
+    table, not the other) or a column mismatch fails loudly with a precise
+    diff; schema migration is out of Round 1 scope.
     """
     present = {
         row["name"]
@@ -96,6 +161,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
     }
     if present == {"call_events", "dead_letter"}:
+        _validate_existing_schema(conn)
         return
     conn.executescript(DDL_SCRIPT)
 
@@ -127,7 +193,11 @@ def insert_event(
     """Insert a ``call_events`` row from a validated event (pre-dispatch state).
 
     ``input_outcome`` preserves the incoming Appendix A outcome for audit only
-    (SPECS §3); ``event_json`` stores the original validated payload.
+    (SPECS §3; the column is NOT NULL — Appendix A mandates ``outcome`` on
+    every event). ``event_json`` stores the original validated payload; any
+    incoming ``retry_count`` survives **only inside it** — the authoritative
+    ``retry_count`` column starts at 0 and is always recomputed as
+    ``attempts - 1`` by terminal updates (SPECS §3/§7).
     """
     conn.execute(
         """

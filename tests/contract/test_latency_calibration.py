@@ -28,7 +28,11 @@ REPORT_PATH = Path(__file__).resolve().parents[2] / "reports" / "latency_calibra
 MU = 5.7
 SIGMA = 0.62
 N_SAMPLER = 50_000
-N_ENDPOINT = 3_000
+# Endpoint wiring check: n=10,000 keeps the p99-ratio standard error ≈ 2.5%,
+# so the ±15% shape band is a ~6σ margin. At n=3,000 the p99 estimator (only
+# ~30 samples beyond the quantile) is heavy-tailed and the band flaked
+# (observed p99/p50 = 5.153 vs target 4.231 on one run).
+N_ENDPOINT = 10_000
 
 # SPECS §4: normative targets and calibration bands (sized for sampling noise).
 TARGETS: dict[str, tuple[float, float]] = {

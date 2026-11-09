@@ -166,6 +166,27 @@ async def test_persist_before_dispatch(tmp_db) -> None:
     assert acceptance.status == "failed_downstream"
 
 
+async def test_incoming_retry_count_is_audit_only_in_event_json(tmp_db) -> None:
+    """The incoming `retry_count` survives only inside `event_json` (audit).
+
+    The database's authoritative `retry_count` column is always service-owned:
+    `attempts - 1` (SPECS §3/§7).
+    """
+    backend = RecordingBackend(PipelineResult(ok=True, http_status=200, latency_ms=5.0))
+    service = make_service(tmp_db, backend, Settings())
+    event = make_event()
+    event_with_retry = CallEvent.model_validate(event.model_dump() | {"retry_count": 7})
+
+    acceptance = await service.accept(event_with_retry)
+
+    assert acceptance.retry_count == 0  # attempts(1) - 1, service-owned
+    row = store.get_event(tmp_db, str(event.event_id))
+    assert row is not None
+    assert row["retry_count"] == 0  # authoritative column: attempts - 1
+    stored = json.loads(row["event_json"])
+    assert stored["retry_count"] == 7  # original incoming value preserved for audit only
+
+
 def test_json_formatter_shape() -> None:
     formatter = JsonFormatter()
     logger = logging.getLogger("format-probe")
