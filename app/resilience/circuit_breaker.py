@@ -17,7 +17,8 @@ with the final outcome, or :meth:`ProbePermit.release` (also via ``with
 permit``) when the call ends without one (cancellation, unexpected
 exception). Settlement frees the slot exactly once, so permits cannot leak and
 a cancelled probe records no evidence. Permits are the single admission
-currency; M3-T10 tags them with the breaker epoch to make stale results inert.
+currency, and each is tagged with the breaker ``epoch`` at acquisition so a
+result from an earlier generation is inert (SPECS §6.2).
 
 Concurrency: every method here is synchronous (no ``await`` in a critical
 section), so on a single asyncio event loop each call is atomic and no lock
@@ -34,6 +35,7 @@ from enum import Enum
 from typing import Self
 
 from app.config import Settings
+from app.metrics import Metrics
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,10 @@ class CircuitState(str, Enum):
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"
+
+
+# ``circuit_state`` gauge encoding (SPECS §9, M3-T11).
+_GAUGE_VALUES = {CircuitState.CLOSED: 0, CircuitState.OPEN: 1, CircuitState.HALF_OPEN: 2}
 
 
 class ProbePermit:
@@ -61,16 +67,24 @@ class ProbePermit:
       evidence is recorded, so a cancelled probe can never close or reopen
       the breaker.
 
-    M3-T10 adds epoch tagging to this object; permits stay the single
-    admission currency either way.
+    M3-T10 tags each permit with the breaker ``epoch`` at acquisition. A
+    result from an earlier generation frees its slot but is otherwise inert:
+    it can never transition the breaker, touch the probe-success counter, or
+    enter the window (SPECS §6.2 "stale results are inert").
     """
-    __slots__ = ("_breaker", "_finished", "_is_probe", "_released")
+    __slots__ = ("_breaker", "_epoch", "_finished", "_is_probe", "_released")
 
-    def __init__(self, breaker: CircuitBreaker, *, is_probe: bool) -> None:
+    def __init__(self, breaker: CircuitBreaker, *, is_probe: bool, epoch: int) -> None:
         self._breaker = breaker
         self._is_probe = is_probe
+        self._epoch = epoch
         self._released = False
         self._finished = False
+
+    @property
+    def epoch(self) -> int:
+        """Breaker generation this permit was acquired in (M3-T10)."""
+        return self._epoch
 
     @property
     def is_probe(self) -> bool:
@@ -137,6 +151,7 @@ class CircuitBreaker:
         *,
         clock: Callable[[], float] = time.monotonic,
         on_transition: Callable[[CircuitState, CircuitState], None] | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         if window_size < 1:
             raise ValueError("window_size must be >= 1")
@@ -160,6 +175,7 @@ class CircuitBreaker:
         self._half_open_success_threshold = half_open_success
         self._clock = clock
         self._on_transition = on_transition
+        self._metrics = metrics
 
         self._state = CircuitState.CLOSED
         self._window: deque[bool] = deque(maxlen=window_size)  # True = failure
@@ -169,11 +185,13 @@ class CircuitBreaker:
         self._half_open_in_flight = 0
         self._half_open_successes = 0
         self._epoch = 0
+        self._publish_state()
 
     @classmethod
     def from_settings(
         cls, settings: Settings, *, clock: Callable[[], float] = time.monotonic,
         on_transition: Callable[[CircuitState, CircuitState], None] | None = None,
+        metrics: Metrics | None = None,
     ) -> CircuitBreaker:
         """Build from the SPECS §8 knobs."""
         return cls(
@@ -186,6 +204,7 @@ class CircuitBreaker:
             half_open_success=settings.cb_half_open_success,
             clock=clock,
             on_transition=on_transition,
+            metrics=metrics,
         )
 
     # --- read-only state ---------------------------------------------------
@@ -233,13 +252,31 @@ class CircuitBreaker:
 
     @property
     def epoch(self) -> int:
-        """Monotonic breaker generation counter (M3-T10 seam).
+        """Monotonic breaker generation counter (M3-T10).
 
-        Incremented on every state transition. M3-T10 tags permits with this
-        value and makes results from an earlier generation inert. No
-        behaviour in this task depends on it yet.
+        Incremented on every state transition. Permits capture this value at
+        acquisition, and a settlement whose epoch no longer matches frees its
+        slot only — it never drives a transition, a probe-success count, or a
+        window entry (SPECS §6.2 "stale results are inert").
         """
         return self._epoch
+
+    def snapshot(self) -> dict[str, object]:
+        """Live breaker state for ``GET /admin/circuit-breaker`` (M3-T11).
+
+        Reporting a snapshot must not mutate the breaker beyond the normal
+        cooldown check: reading after the cooldown has elapsed reports
+        ``half_open`` exactly as :attr:`state` would.
+        """
+        self._maybe_advance_from_open()
+        return {
+            "state": self._state.value,
+            "window_size": self._window_size,
+            "failure_ratio": self.failure_ratio,
+            "consecutive_failures": self._consecutive_failures,
+            "opened_at": self._opened_at,
+            "last_transition_at": self._last_transition_at,
+        }
 
     # --- gate --------------------------------------------------------------
 
@@ -284,13 +321,13 @@ class CircuitBreaker:
         """
         self._maybe_advance_from_open()
         if self._state is CircuitState.CLOSED:
-            return ProbePermit(self, is_probe=False)
+            return ProbePermit(self, is_probe=False, epoch=self._epoch)
         if self._state is CircuitState.OPEN:
             return None
         if self._half_open_in_flight >= self._half_open_probes:
             return None
         self._half_open_in_flight += 1
-        return ProbePermit(self, is_probe=True)
+        return ProbePermit(self, is_probe=True, epoch=self._epoch)
 
     # --- outcomes ----------------------------------------------------------
 
@@ -343,9 +380,8 @@ class CircuitBreaker:
             self._record_half_open_outcome(success)
             return
         if self._state is CircuitState.OPEN:
-            # Late results from calls dispatched before the breaker opened:
-            # they are evidence from a dead period, not fresh probe data.
-            # (M3-T10 formalises this with epochs.) Inert by design.
+            # Outcomes from calls dispatched before the breaker opened are
+            # stale (M3-T10 epoch guard) — they are never fresh evidence.
             return
         self._record_closed_outcome(success)
 
@@ -369,10 +405,27 @@ class CircuitBreaker:
         ``success is None`` means "released without evidence": free the slot,
         never touch the probe-success counter or the window. Only HALF_OPEN
         permits consume a slot; a CLOSED passthrough permit has none.
+
+        A permit acquired in an earlier breaker generation is **stale**: its
+        slot is still freed (so the budget cannot leak) but its evidence is
+        discarded — a late success must not close a breaker that has since
+        reopened, and a late failure must not penalise the fresh generation.
         """
         if permit.is_probe:
             self._half_open_in_flight = max(0, self._half_open_in_flight - 1)
         if success is None:
+            return
+        if permit.epoch != self._epoch:
+            logger.info(
+                "cb_stale_result",
+                extra={
+                    "json_fields": {
+                        "permit_epoch": permit.epoch,
+                        "current_epoch": self._epoch,
+                        "success": success,
+                    }
+                },
+            )
             return
         self._apply_outcome(success)
 
@@ -400,5 +453,15 @@ class CircuitBreaker:
             "cb_transition",
             extra={"json_fields": {"from": from_state.value, "to": to_state.value}},
         )
+        self._publish_state()
+        if self._metrics is not None:
+            self._metrics.circuit_transitions_total.labels(
+                **{"from": from_state.value, "to": to_state.value}
+            ).inc()
         if self._on_transition is not None:
             self._on_transition(from_state, to_state)
+
+    def _publish_state(self) -> None:
+        """Expose the current state as the ``circuit_state`` gauge (M3-T11)."""
+        if self._metrics is not None:
+            self._metrics.circuit_state.set(_GAUGE_VALUES[self._state])

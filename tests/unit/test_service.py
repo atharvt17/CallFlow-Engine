@@ -14,6 +14,7 @@ from app.logging import JsonFormatter
 from app.metrics import Metrics
 from app.models import CallEvent
 from app.pipeline.base import PipelineResult
+from app.resilience.retry import RetryOutcome
 from app.service import CallService
 
 NOW = "2026-09-01T09:03:12+00:00"
@@ -185,6 +186,91 @@ async def test_incoming_retry_count_is_audit_only_in_event_json(tmp_db) -> None:
     assert row["retry_count"] == 0  # authoritative column: attempts - 1
     stored = json.loads(row["event_json"])
     assert stored["retry_count"] == 7  # original incoming value preserved for audit only
+
+
+class ResilientBackendStub:
+    """Stands in for ``ResilientPipelineClient`` (M3-T14 service wiring).
+
+    Records ``execute`` calls and returns a scripted :class:`RetryOutcome`, so
+    service tests can assert on the *logical call* contract without running
+    the breaker/executor again (those are covered in their own suites).
+    """
+
+    def __init__(self, outcomes: list[RetryOutcome]) -> None:
+        self._outcomes = list(outcomes)
+        self.executions = 0
+        self.processed: list[tuple[str, str]] = []
+
+    async def aclose(self) -> None:
+        pass
+
+    async def execute(self, event_id: str, audio_ref: str) -> RetryOutcome:
+        self.executions += 1
+        return self._outcomes.pop(0)
+
+    async def process(self, event_id: str, audio_ref: str) -> PipelineResult:
+        # The service must prefer ``execute`` (it needs attempts/deferred).
+        self.processed.append((event_id, audio_ref))
+        return (await self.execute(event_id, audio_ref)).result
+
+
+def _outcome(*, ok: bool, attempts: int = 1, reason: str | None = None) -> RetryOutcome:
+    result = PipelineResult(
+        ok=ok,
+        reason=reason,
+        http_status=200 if ok else 503,
+        latency_ms=250.0 if ok else 100.0,
+    )
+    return RetryOutcome(result=result, attempts=attempts)
+
+
+async def test_resilient_backend_attempts_and_retry_count_persisted(tmp_db) -> None:
+    """M3-T14: attempts/retry_count come from the logical call, not a fixed 1."""
+    backend = ResilientBackendStub([_outcome(ok=True, attempts=3)])
+    service = make_service(tmp_db, backend, Settings(success_ptp_rate=0.0))
+    event = make_event()
+
+    acceptance = await service.accept(event)
+
+    assert acceptance.status == "processed"
+    assert acceptance.attempts == 3
+    assert acceptance.retry_count == 2
+    row = store.get_event(tmp_db, str(event.event_id))
+    assert row is not None
+    assert row["attempts"] == 3 and row["retry_count"] == 2
+    assert backend.processed == [], "service must dispatch through execute()"
+
+
+async def test_resilient_backend_exhausted_attempts_recorded(tmp_db) -> None:
+    backend = ResilientBackendStub(
+        [_outcome(ok=False, attempts=3, reason="downstream_timeout")]
+    )
+    service = make_service(tmp_db, backend, Settings())
+    acceptance = await service.accept(make_event())
+
+    assert acceptance.status == "failed_downstream"
+    assert acceptance.failure_reason == "downstream_timeout"
+    assert acceptance.attempts == 3
+    assert acceptance.retry_count == 2
+
+
+async def test_retries_do_not_double_count_attempt_metrics(tmp_db) -> None:
+    """Attempt metrics belong to the executor (inside the decorator); the
+    service must not add a second observation for the logical call."""
+    metrics = Metrics()
+    backend = ResilientBackendStub([_outcome(ok=True, attempts=3)])
+    service = CallService(tmp_db, backend, Settings(success_ptp_rate=0.0), metrics)
+
+    await service.accept(make_event())
+
+    body = metrics.render()[0].decode()
+    # Attempt-level observations stay at zero: the executor inside the
+    # decorator owns them, so the service must not add a second observation
+    # per logical call (it would double-count attempts).
+    assert "pipeline_attempt_latency_ms_count 0.0" in body
+    assert "retries_total 0.0" in body
+    assert "e2e_latency_ms_count 1.0" in body
+    assert 'calls_total{outcome="connected",status="processed"} 1.0' in body
 
 
 def test_json_formatter_shape() -> None:

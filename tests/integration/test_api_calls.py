@@ -133,8 +133,10 @@ async def test_forced_total_failure_yields_failed_downstream(make_stack) -> None
         body = resp.json()
         assert body["status"] == "failed_downstream"
         assert body["outcome"] == "failed_downstream"
-        assert body["attempts"] == 1  # single-attempt scope: no resilience yet
-        assert body["retry_count"] == 0
+        # Resilience is live (M3-T14): the 503 is retryable, so one logical call
+        # uses all 3 attempts (SPECS §6.1) and reports retry_count = attempts − 1.
+        assert body["attempts"] == 3
+        assert body["retry_count"] == 2
         assert body["failure_reason"] == "downstream_timeout"
         assert body["dlq_id"] is None  # M2 staged gap: DLQ write path lands M3-T20
 

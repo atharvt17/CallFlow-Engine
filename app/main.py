@@ -27,12 +27,13 @@ from app.config import Settings
 from app.logging import log_event, setup_logging
 from app.metrics import Metrics
 from app.pipeline import PipelineBackend, create_backend
+from app.pipeline.resilient import ResilientPipelineClient
+from app.resilience.circuit_breaker import CircuitBreaker
 from app.service import CallService
 
 logger = logging.getLogger(__name__)
 
-# Placeholder values until the breaker (Sprint 3) and deferral (Sprint 4) exist.
-_PLACEHOLDER_CIRCUIT_STATE = "closed"
+# Placeholder value until deferral exists (Sprint 4).
 _PLACEHOLDER_DEFERRED_PENDING = 0
 
 
@@ -56,7 +57,13 @@ def create_app(
     conn = store.connect(settings.db_path)
     store.init_db(conn)
     metrics = Metrics()
-    service = CallService(conn, backend, settings, metrics)
+    breaker = CircuitBreaker.from_settings(settings, metrics=metrics)
+    # Resilience wraps the boundary (M3-T14): retry + timeout + breaker
+    # admission live here, so concrete backends stay policy-free.
+    resilient = ResilientPipelineClient.from_settings(
+        backend, breaker, settings, metrics=metrics
+    )
+    service = CallService(conn, resilient, settings, metrics)
     started_at = time.monotonic()
 
     @asynccontextmanager
@@ -76,8 +83,10 @@ def create_app(
     app.state.settings = settings
     app.state.conn = conn
     app.state.service = service
-    app.state.backend = backend
+    app.state.backend = resilient
+    app.state.raw_backend = backend
     app.state.metrics = metrics
+    app.state.breaker = breaker
     app.state.started_at = started_at
     app.include_router(router)
 
@@ -86,7 +95,7 @@ def create_app(
         return HealthResponse(
             status="ok",
             uptime_s=time.monotonic() - started_at,
-            circuit_state=_PLACEHOLDER_CIRCUIT_STATE,
+            circuit_state=breaker.state.value,
             deferred_pending=_PLACEHOLDER_DEFERRED_PENDING,
         )
 

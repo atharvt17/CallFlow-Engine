@@ -80,7 +80,11 @@ async def test_failed_calls_populate_failure_series(make_stack) -> None:
             text,
             re.MULTILINE,
         )
-        assert re.search(r'^pipeline_attempts_total\{result="error"\} 2\.0$', text, re.MULTILINE)
+        # Resilience is live (M3-T14): each of the 2 logical calls makes 3
+        # attempts, so the attempt-level counter sees 6 errors — never the
+        # breaker window, which receives one outcome per logical call.
+        assert re.search(r'^pipeline_attempts_total\{result="error"\} 6\.0$', text, re.MULTILINE)
+        assert re.search(r"^retries_total 4\.0$", text, re.MULTILINE)  # 2 per call
 
 
 def test_cardinality_rule_no_identifiers_in_labels() -> None:

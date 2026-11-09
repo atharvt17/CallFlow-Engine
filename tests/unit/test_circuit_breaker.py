@@ -14,10 +14,12 @@ or unexpected exceptions, and never counted per attempt.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
 from app.config import Settings
+from app.metrics import Metrics
 from app.pipeline.base import PipelineResult
 from app.resilience.circuit_breaker import CircuitBreaker, CircuitState
 from app.resilience.retry import RetryPolicy, execute_with_retry
@@ -525,6 +527,353 @@ class TestHalfOpenProbePermits:
         assert outcome is not None and outcome.attempts == 3
         assert breaker.window_samples == 1  # attempts never inflate the window
         assert breaker.window_failures == 0
+
+    async def test_window_count_equals_logical_calls_not_attempts(self) -> None:
+        """SPECS §6.2 accounting: N logical calls failing 3 attempts each enter
+        the window as N outcomes, never 3N — so retry amplification cannot trip
+        a breaker that logical-call math says is healthy."""
+        breaker = make_breaker(consecutive_failures=100)
+        # 6 logical calls × 3 failed attempts = 18 attempts < min_throughput(10)?
+        # No: 18 ≥ 10, so attempt-based accounting WOULD trip on 18/18 = 100%.
+        for _ in range(6):
+            outcome = await logical_call(
+                breaker, ScriptedBackend([_fail(), _fail(), _fail()])
+            )
+            assert outcome is not None and outcome.attempts == 3
+        assert breaker.window_samples == 6
+        assert breaker.state is CircuitState.CLOSED  # 6 < min_throughput 10
+
+    async def test_retry_success_hides_attempt_failures_from_window(self) -> None:
+        """A logical call that recovers on attempt 3 is a *success* in the
+        window even though two attempts failed."""
+        breaker = make_breaker(consecutive_failures=100)
+        for _ in range(10):
+            await logical_call(breaker, ScriptedBackend([_fail(), _fail(), _ok()]))
+        assert breaker.window_samples == 10
+        assert breaker.window_failures == 0
+        assert breaker.failure_ratio == 0.0
+        assert breaker.state is CircuitState.CLOSED  # ratio 0.0 never trips
+
+    async def test_open_fail_fast_dispatches_zero_backend_calls(self) -> None:
+        """SPECS §6.2/§11: while OPEN the gate rejects before any dispatch, so
+        the backend is never called and no window entry is recorded."""
+        clock = FakeClock()
+        breaker = make_breaker(clock=clock)
+        trip_open(breaker, clock)
+        samples_before = breaker.window_samples
+        backend = ScriptedBackend([_ok()])
+        for _ in range(5):
+            assert await logical_call(breaker, backend) is None
+        assert backend.calls == 0
+        assert breaker.window_samples == samples_before
+        assert breaker.state is CircuitState.OPEN
+
+    async def test_half_open_over_budget_fail_fast_dispatches_zero_backend_calls(self) -> None:
+        clock = FakeClock()
+        breaker = self._half_open(clock, half_open_probes=3)
+        gate = asyncio.Event()
+
+        async def op() -> PipelineResult:
+            await gate.wait()
+            return _ok()
+
+        held = [asyncio.create_task(logical_call(breaker, op)) for _ in range(3)]
+        await asyncio.sleep(0)
+        assert breaker.half_open_in_flight == 3
+        spare = ScriptedBackend([_ok()])
+        assert await logical_call(breaker, spare) is None
+        assert spare.calls == 0
+        gate.set()
+        await asyncio.gather(*held)
+
+
+class TestStaleProbes:
+    """M3-T10/T13: results from an earlier breaker generation are inert.
+
+    A probe is tagged with the breaker ``epoch`` at acquisition; settlement
+    from any other epoch may free its slot but must never drive a transition,
+    touch the probe-success counter, or enter the window.
+    """
+
+    def _half_open(self, clock: FakeClock, **overrides) -> CircuitBreaker:
+        breaker = make_breaker(clock=clock, **overrides)
+        trip_open(breaker, clock)
+        clock.advance(5.0)
+        assert breaker.state is CircuitState.HALF_OPEN
+        return breaker
+
+    def test_permit_carries_acquisition_epoch(self) -> None:
+        clock = FakeClock()
+        breaker = self._half_open(clock)
+        epoch = breaker.epoch
+        permit = breaker.acquire_probe()
+        assert permit is not None
+        assert permit.epoch == epoch
+
+    def test_epoch_advances_on_every_transition(self) -> None:
+        clock = FakeClock()
+        breaker = make_breaker(clock=clock)
+        assert breaker.epoch == 0
+        trip_open(breaker, clock)
+        assert breaker.epoch == 1
+        clock.advance(5.0)
+        assert breaker.state is CircuitState.HALF_OPEN
+        assert breaker.epoch == 2
+        for _ in range(2):
+            permit = breaker.acquire_probe()
+            assert permit is not None
+            permit.finish(success=True)
+        assert breaker.state is CircuitState.CLOSED
+        assert breaker.epoch == 3
+
+    def test_stale_probe_success_after_reopen_is_inert(self) -> None:
+        clock = FakeClock()
+        breaker = self._half_open(clock, half_open_probes=3, half_open_success=2)
+        early = breaker.acquire_probe()
+        late = breaker.acquire_probe()
+        assert early is not None and late is not None
+        late.finish(success=False)  # reopens: epoch advances
+        assert breaker.state is CircuitState.OPEN
+        clock.advance(5.0)  # fresh HALF_OPEN generation
+        assert breaker.state is CircuitState.HALF_OPEN
+
+        early.finish(success=True)  # stale: must not count as a probe success
+        fresh = breaker.acquire_probe()
+        assert fresh is not None
+        fresh.finish(success=True)
+        # Only the fresh success counts (1/2) — if the stale one had counted,
+        # this would have closed the breaker.
+        assert breaker.state is CircuitState.HALF_OPEN
+
+        final = breaker.acquire_probe()
+        assert final is not None
+        final.finish(success=True)
+        assert breaker.state is CircuitState.CLOSED
+
+    def test_stale_probe_failure_after_close_does_not_touch_window(self) -> None:
+        clock = FakeClock()
+        breaker = self._half_open(clock, half_open_probes=3, half_open_success=2)
+        stale = breaker.acquire_probe()
+        assert stale is not None
+        for _ in range(2):
+            permit = breaker.acquire_probe()
+            assert permit is not None
+            permit.finish(success=True)
+        assert breaker.state is CircuitState.CLOSED
+        assert breaker.window_samples == 0  # reset on close
+
+        stale.finish(success=False)  # epoch mismatch: no failure recorded
+        assert breaker.state is CircuitState.CLOSED
+        assert breaker.window_samples == 0
+        assert breaker.consecutive_failures == 0
+
+    def test_stale_result_does_not_double_penalize_after_reopen(self) -> None:
+        clock = FakeClock()
+        breaker = self._half_open(clock, half_open_probes=3)
+        first = breaker.acquire_probe()
+        second = breaker.acquire_probe()
+        assert first is not None and second is not None
+        first.finish(success=False)  # reopens
+        assert breaker.state is CircuitState.OPEN
+        clock.advance(5.0)
+        assert breaker.state is CircuitState.HALF_OPEN
+        # A second stale failure must not reopen the fresh generation.
+        second.finish(success=False)
+        assert breaker.state is CircuitState.HALF_OPEN
+
+    def test_stale_settlement_dispatches_no_transition_and_no_window_reset(self) -> None:
+        """After a close, a stale probe's late failure must not re-enter the
+        window, bump the consecutive counter, restamp transition metadata, or
+        emit a transition."""
+        clock = FakeClock()
+        transitions: list[tuple[CircuitState, CircuitState]] = []
+        breaker = make_breaker(
+            clock=clock, half_open_probes=3, half_open_success=2,
+            on_transition=lambda f, t: transitions.append((f, t)),
+        )
+        trip_open(breaker, clock)
+        clock.advance(5.0)
+        stale = breaker.acquire_probe()
+        assert stale is not None
+        for _ in range(2):
+            permit = breaker.acquire_probe()
+            assert permit is not None
+            permit.finish(success=True)
+        assert breaker.state is CircuitState.CLOSED
+        history = list(transitions)
+        transition_at = breaker.last_transition_at
+        epoch = breaker.epoch
+
+        clock.advance(1.0)
+        stale.finish(success=False)
+
+        assert transitions == history  # no transition emitted
+        assert breaker.last_transition_at == transition_at
+        assert breaker.epoch == epoch  # generation untouched
+        assert breaker.window_samples == 0
+        assert breaker.consecutive_failures == 0
+
+    def test_stale_slot_is_still_freed(self) -> None:
+        """Stale evidence is discarded, but the HALF_OPEN budget must not leak:
+        a stale permit settles its slot exactly once."""
+        clock = FakeClock()
+        breaker = self._half_open(clock, half_open_probes=2, half_open_success=2)
+        stale = breaker.acquire_probe()
+        other = breaker.acquire_probe()
+        assert stale is not None and other is not None
+        other.finish(success=True)  # 1/2: stays HALF_OPEN, slot freed
+        assert breaker.half_open_in_flight == 1
+        breaker.reset()
+        # Force a new generation by closing then re-opening via a fresh trip.
+        fresh = breaker.acquire_probe()
+        assert fresh is not None
+        fresh.finish(success=True)
+        assert breaker.state is CircuitState.CLOSED  # 2nd success closes
+        assert breaker.half_open_in_flight == 1  # only `stale` still holds one
+        stale.finish(success=True)  # stale: no evidence, slot freed
+        assert breaker.half_open_in_flight == 0
+        assert breaker.state is CircuitState.CLOSED
+        assert breaker.window_samples == 0
+
+    async def test_stale_probe_outcome_after_reopen_through_retry_sequence(
+        self, caplog
+    ) -> None:
+        """A whole retry sequence acquired in generation N settles after the
+        breaker has reopened in N+1: none of its attempts can affect the new
+        generation, and the staleness is logged for operators."""
+        clock = FakeClock()
+        breaker = self._half_open(clock, half_open_probes=3, half_open_success=2)
+        gate = asyncio.Event()
+
+        async def slow_ok() -> PipelineResult:
+            await gate.wait()
+            return _ok()
+
+        slow = asyncio.create_task(logical_call(breaker, slow_ok))
+        await asyncio.sleep(0)
+        assert breaker.half_open_in_flight == 1
+
+        reopens = breaker.acquire_probe()
+        assert reopens is not None
+        reopens.finish(success=False)
+        assert breaker.state is CircuitState.OPEN
+        clock.advance(5.0)
+        assert breaker.state is CircuitState.HALF_OPEN
+
+        with caplog.at_level(logging.INFO, logger="app.resilience.circuit_breaker"):
+            gate.set()
+            outcome = await asyncio.wait_for(slow, timeout=2.0)
+        assert outcome is not None and outcome.ok
+        assert breaker.state is CircuitState.HALF_OPEN  # stale success: no close
+        assert any(
+            record.getMessage() == "cb_stale_result" for record in caplog.records
+        )
+
+
+class TestObservability:
+    """M3-T11: transitions visible in logs, metrics, and a snapshot."""
+
+    def _metric_values(self, metrics) -> dict[str, float]:
+        body = metrics.render()[0].decode()
+        return {
+            line.split("{")[0]: float(line.rsplit(" ", 1)[1])
+            for line in body.splitlines()
+            if line and not line.startswith("#")
+        }
+
+    def test_snapshot_shape_and_values(self) -> None:
+        clock = FakeClock()
+        breaker = make_breaker(clock=clock)
+        breaker.record_logical_outcome(success=True)
+        breaker.record_logical_outcome(success=False)
+        snapshot = breaker.snapshot()
+        assert set(snapshot) == {
+            "state",
+            "window_size",
+            "failure_ratio",
+            "consecutive_failures",
+            "opened_at",
+            "last_transition_at",
+        }
+        assert snapshot["state"] == "closed"
+        assert snapshot["window_size"] == 20
+        assert snapshot["failure_ratio"] == 0.5
+        assert snapshot["consecutive_failures"] == 1
+        assert snapshot["opened_at"] is None
+
+    def test_snapshot_reflects_open_with_timestamps(self) -> None:
+        clock = FakeClock()
+        breaker = make_breaker(clock=clock)
+        trip_open(breaker, clock)
+        snapshot = breaker.snapshot()
+        assert snapshot["state"] == "open"
+        assert snapshot["opened_at"] == clock.now
+        assert snapshot["last_transition_at"] == clock.now
+
+    def test_snapshot_advances_cooldown(self) -> None:
+        clock = FakeClock()
+        breaker = make_breaker(clock=clock)
+        trip_open(breaker, clock)
+        clock.advance(5.0)
+        assert breaker.snapshot()["state"] == "half_open"
+
+    def test_gauge_follows_state(self) -> None:
+        metrics = Metrics()
+        clock = FakeClock()
+        breaker = make_breaker(clock=clock, metrics=metrics)
+        assert "circuit_state 0.0" in metrics.render()[0].decode()
+        trip_open(breaker, clock)
+        assert "circuit_state 1.0" in metrics.render()[0].decode()
+        clock.advance(5.0)
+        assert breaker.state is CircuitState.HALF_OPEN
+        assert "circuit_state 2.0" in metrics.render()[0].decode()
+
+    def test_transitions_counted_by_pair(self) -> None:
+        metrics = Metrics()
+        clock = FakeClock()
+        breaker = make_breaker(clock=clock, metrics=metrics)
+        trip_open(breaker, clock)
+        clock.advance(5.0)
+        assert breaker.state is CircuitState.HALF_OPEN
+        for _ in range(2):
+            permit = breaker.acquire_probe()
+            assert permit is not None
+            permit.finish(success=True)
+        body = metrics.render()[0].decode()
+        assert 'circuit_transitions_total{from="closed",to="open"} 1.0' in body
+        assert 'circuit_transitions_total{from="open",to="half_open"} 1.0' in body
+        assert 'circuit_transitions_total{from="half_open",to="closed"} 1.0' in body
+        assert "circuit_state 0.0" in body
+
+    def test_transition_logged_with_json_fields(self, caplog) -> None:
+        clock = FakeClock()
+        breaker = make_breaker(clock=clock)
+        with caplog.at_level(logging.INFO, logger="app.resilience.circuit_breaker"):
+            trip_open(breaker, clock)
+        records = [r for r in caplog.records if r.getMessage() == "cb_transition"]
+        assert records, "every transition must emit cb_transition"
+        fields = records[-1].json_fields
+        assert (fields["from"], fields["to"]) == ("closed", "open")
+
+    def test_stale_result_logged_as_metric_only(self, caplog) -> None:
+        clock = FakeClock()
+        breaker = make_breaker(clock=clock, half_open_probes=3, half_open_success=2)
+        trip_open(breaker, clock)
+        clock.advance(5.0)
+        assert breaker.state is CircuitState.HALF_OPEN
+        stale = breaker.acquire_probe()
+        assert stale is not None
+        for _ in range(2):
+            permit = breaker.acquire_probe()
+            assert permit is not None
+            permit.finish(success=True)
+        assert breaker.state is CircuitState.CLOSED
+        with caplog.at_level(logging.INFO, logger="app.resilience.circuit_breaker"):
+            stale.finish(success=False)
+        records = [r for r in caplog.records if r.getMessage() == "cb_stale_result"]
+        assert len(records) == 1
+        assert records[0].json_fields["success"] is False
+        assert breaker.state is CircuitState.CLOSED
 
 
 class TestTransitionHook:

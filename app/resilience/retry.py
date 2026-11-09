@@ -229,15 +229,29 @@ class AttemptRecord:
 
 @dataclass(frozen=True)
 class RetryOutcome:
-    """Final outcome of one logical call (the whole retry sequence)."""
+    """Final outcome of one logical call (the whole retry sequence).
+
+    ``deferred`` marks a call the breaker refused to dispatch — either outright
+    (OPEN/HALF_OPEN-over-budget) or because it went OPEN between attempts. Such
+    a call has **no downstream evidence**: ``attempts`` counts only attempts
+    that actually reached the backend, and the breaker records nothing for it
+    (SPECS §6.2/§6.3). Persisting the call for later recovery is the caller's
+    job (M3-T16).
+    """
 
     result: PipelineResult
     attempts: int
     records: tuple[AttemptRecord, ...] = field(default_factory=tuple)
+    deferred: bool = False
 
     @property
     def ok(self) -> bool:
-        return self.result.ok
+        return self.result.ok and not self.deferred
+
+    @property
+    def reason(self) -> str | None:
+        """Failure reason of the final result (``circuit_open`` when deferred)."""
+        return self.result.reason
 
     @property
     def retry_count(self) -> int:

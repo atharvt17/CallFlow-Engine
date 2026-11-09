@@ -15,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from app import store
 from app.models import CallEvent
+from app.resilience.circuit_breaker import CircuitBreaker
 from app.service import CallAcceptance, CallService
 
 router = APIRouter()
@@ -67,3 +68,10 @@ async def metrics(request: Request) -> Response:
     """Prometheus text exposition for this app's registry (SPECS §9)."""
     body, content_type = request.app.state.metrics.render()
     return Response(content=body, media_type=content_type)
+
+
+@router.get("/admin/circuit-breaker")
+async def circuit_breaker_snapshot(request: Request) -> dict[str, object]:
+    """Live breaker snapshot for the runbook (SPECS §5, Appendix I; M3-T11)."""
+    breaker: CircuitBreaker = request.app.state.breaker
+    return breaker.snapshot()

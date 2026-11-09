@@ -34,6 +34,7 @@ from app.logging import log_event
 from app.metrics import Metrics
 from app.models import CallEvent, EventOutcome
 from app.pipeline.base import PipelineBackend
+from app.resilience.retry import RetryOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +44,10 @@ _AUDIO_REF = "synthetic"
 
 @dataclass(frozen=True)
 class CallAcceptance:
-    """Result of submitting one event (single attempt or duplicate)."""
+    """Result of submitting one event (terminal, deferred, or duplicate)."""
 
     event_id: str
-    status: str  # processed | failed_downstream (or the stored status for duplicates)
+    status: str  # processed | failed_downstream | deferred (or stored status)
     outcome: str | None
     attempts: int
     retry_count: int
@@ -124,48 +125,72 @@ class CallService:
             duplicate=False,
         )
 
-        # One logical call is in flight around the (currently single) attempt;
-        # Sprint 3's retry executor keeps this gauge around the whole sequence.
+        # One logical call is in flight around the whole retry sequence; the
+        # resilient decorator keeps retry/timeout/breaker concerns inside the
+        # boundary (M3-T14), so the service observes one outcome per call.
         self._metrics.in_flight_calls.inc()
         try:
-            result = await self._backend.process(event_id, _AUDIO_REF)
+            outcome = await self._dispatch(event_id)
         finally:
             self._metrics.in_flight_calls.dec()
         e2e_latency_ms = (time.perf_counter() - started) * 1000
+        result = outcome.result
+        attempts = outcome.attempts
 
-        # Attempt-level observability (never feeds breaker statistics, §6.2).
-        if result.ok:
-            attempt_result = "success"
-        elif result.reason == "timeout":
-            attempt_result = "timeout"
-        else:
-            attempt_result = "error"
-        self._metrics.pipeline_attempts_total.labels(result=attempt_result).inc()
-        if result.latency_ms is not None:
-            self._metrics.pipeline_attempt_latency_ms.observe(result.latency_ms)
+        if outcome.deferred:
+            # Breaker refused dispatch (SPECS §6.2): no downstream evidence and
+            # no terminal accounting. The deferred record stays recoverable;
+            # the 202 body/enqueue machinery lands in M3-T16/T17.
+            updated_at = self._now()
+            with store.begin_immediate(self._conn):
+                self._conn.execute(
+                    "UPDATE call_events SET status = 'deferred', updated_at = ? "
+                    "WHERE event_id = ?",
+                    (updated_at, event_id),
+                )
+            log_event(
+                logger,
+                "call_deferred",
+                event_id=event_id,
+                reason=outcome.reason,
+                attempts=attempts,
+            )
+            return CallAcceptance(
+                event_id=event_id,
+                status="deferred",
+                outcome=None,
+                attempts=attempts,
+                retry_count=0,
+                pipeline_latency_ms=None,
+                e2e_latency_ms=e2e_latency_ms,
+                failure_reason=outcome.reason,
+                duplicate=False,
+            )
 
         if result.ok:
             ptp_taken = self._ptp_draw.random() < self._settings.success_ptp_rate
-            outcome = EventOutcome.PTP_TAKEN if ptp_taken else EventOutcome.CONNECTED
+            event_outcome = EventOutcome.PTP_TAKEN if ptp_taken else EventOutcome.CONNECTED
             status = "processed"
             failure_reason = None
         else:
-            outcome = EventOutcome.FAILED_DOWNSTREAM
+            event_outcome = EventOutcome.FAILED_DOWNSTREAM
             status = "failed_downstream"
             failure_reason = result.reason
+        outcome_value = event_outcome.value
 
         updated_at = self._now()
         pipeline_latency_ms = (
             None if result.latency_ms is None else round(result.latency_ms)
         )
+        retry_count = outcome.retry_count
         with store.begin_immediate(self._conn):
             store.update_event_terminal(
                 self._conn,
                 event_id,
                 status=status,
-                outcome=outcome.value,
-                attempts=1,
-                retry_count=0,  # attempts - 1 (SPECS §3)
+                outcome=outcome_value,
+                attempts=attempts,
+                retry_count=retry_count,
                 pipeline_latency_ms=pipeline_latency_ms,
                 e2e_latency_ms=e2e_latency_ms,
                 failure_reason=failure_reason,
@@ -174,8 +199,8 @@ class CallService:
 
         fields: dict[str, Any] = {
             "event_id": event_id,
-            "outcome": outcome.value,
-            "attempts": 1,
+            "outcome": outcome_value,
+            "attempts": attempts,
             "pipeline_latency_ms": pipeline_latency_ms,
             "e2e_latency_ms": round(e2e_latency_ms, 1),
         }
@@ -183,20 +208,35 @@ class CallService:
             fields["failure_reason"] = failure_reason
         log_event(logger, "call_processed" if result.ok else "call_failed", **fields)
 
-        self._metrics.calls_total.labels(outcome=outcome.value, status=status).inc()
+        self._metrics.calls_total.labels(outcome=outcome_value, status=status).inc()
         self._metrics.e2e_latency_ms.observe(e2e_latency_ms)
 
         return CallAcceptance(
             event_id=event_id,
             status=status,
-            outcome=outcome.value,
-            attempts=1,
-            retry_count=0,
+            outcome=outcome_value,
+            attempts=attempts,
+            retry_count=retry_count,
             pipeline_latency_ms=pipeline_latency_ms,
             e2e_latency_ms=e2e_latency_ms,
             failure_reason=failure_reason,
             duplicate=False,
         )
+
+    async def _dispatch(self, event_id: str) -> RetryOutcome:
+        """One logical call through the boundary.
+
+        The production backend is the resilient decorator (:meth:`execute`
+        exposes attempts and the deferred signal). A plain single-attempt
+        backend is still supported — it is wrapped into an equivalent
+        one-attempt outcome — so the boundary contract stays "any
+        PipelineBackend" (PLAN D1).
+        """
+        execute = getattr(self._backend, "execute", None)
+        if execute is not None:
+            return await execute(event_id, _AUDIO_REF)
+        result = await self._backend.process(event_id, _AUDIO_REF)
+        return RetryOutcome(result=result, attempts=1)
 
     def _acceptance_from_row(self, row: sqlite3.Row, *, duplicate: bool) -> CallAcceptance:
         """Mirror the stored record (idempotent duplicate short-circuit)."""
