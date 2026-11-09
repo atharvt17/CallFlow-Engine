@@ -6,6 +6,7 @@ TASKS.MD
 TASKS.md
 CHALLENGE.MD
 CHALLENGE.md
+.commandcode
 *.pdf
 
 # --- Agent activity changelog (local-only; never commit or push) ---
