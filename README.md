@@ -4,11 +4,11 @@ A compliant, resilient collections voice-agent **inference service** wrapped
 around a spec-exact mock of the STT→LLM→TTS pipeline
 (Predixion AI × TalentX Collections Agent Challenge — Round 1, local track).
 
-> **Status:** implementation in progress per `TASKS.md`. Sprint 0 scaffold is
-> done — both services build, start, and self-report healthy. The graded
-> pipeline contract (Sprint 1), the resilience engine and persistent deferral
-> (Sprints 3–4), DLQ inspect/replay (Sprint 5), the traffic generator (Sprint 6)
-> and the cost writeup (Sprint 7) land in the coming sprints.
+> **Status:** implementation in progress per `TASKS.md`. The graded pipeline
+> contract (Sprint 1), the resilience engine and persistent deferral
+> (Sprints 3–4), and DLQ inspect/replay (Sprint 5) are complete; the traffic
+> generator (Sprint 6) and the cost writeup (Sprint 7) land in the coming
+> sprints.
 
 ## Prerequisites
 
