@@ -29,11 +29,8 @@ from app.api import router
 from app.config import Settings
 from app.deferral import DeferralQueue
 from app.logging import log_event, setup_logging
-from app.metrics import Metrics
-from app.pipeline import PipelineBackend, create_backend
-from app.pipeline.resilient import ResilientPipelineClient
-from app.resilience.circuit_breaker import CircuitBreaker
-from app.service import CallService
+from app.pipeline import PipelineBackend
+from app.runtime import ServiceRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -59,18 +56,13 @@ def create_app(
     """Build the inference app; settings and backend injectable for tests."""
     if settings is None:
         settings = Settings()
-    if backend is None:
-        backend = create_backend(settings)
-    conn = store.connect(settings.db_path)
-    store.init_db(conn)
-    metrics = Metrics()
-    breaker = CircuitBreaker.from_settings(settings, metrics=metrics)
-    # Resilience wraps the boundary (M3-T14): retry + timeout + breaker
-    # admission live here, so concrete backends stay policy-free.
-    resilient = ResilientPipelineClient.from_settings(
-        backend, breaker, settings, metrics=metrics
-    )
-    service = CallService(conn, resilient, settings, metrics)
+    # One wiring path with the CLI (M4-T02): the same store + resilience stack
+    # + service, so a replay from either surface behaves identically.
+    runtime = ServiceRuntime.build(settings, backend)
+    conn = runtime.conn
+    metrics = runtime.metrics
+    breaker = runtime.breaker
+    service = runtime.service
     deferral = DeferralQueue(conn, service, settings, metrics)
     service.bind_deferral(deferral)
     # Reconstruct the queue from SQLite before the app serves anything
@@ -100,8 +92,7 @@ def create_app(
                     pass
                 except Exception:
                     logger.exception("deferred drainer stopped with an error")
-            await backend.aclose()
-            conn.close()
+            await runtime.aclose()
 
     app = FastAPI(
         title="collections-voice-agent inference",
@@ -113,8 +104,8 @@ def create_app(
     app.state.conn = conn
     app.state.service = service
     app.state.deferral = deferral
-    app.state.backend = resilient
-    app.state.raw_backend = backend
+    app.state.backend = runtime.backend
+    app.state.raw_backend = runtime.raw_backend
     app.state.metrics = metrics
     app.state.breaker = breaker
     app.state.started_at = started_at

@@ -21,11 +21,12 @@ Invariants enforced here:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -44,6 +45,11 @@ _AUDIO_REF = "synthetic"
 
 # Outcome of one deferred dispatch (internal to the drainer).
 DeferredOutcome = str  # "processed" | "failed" | "expired" | "deferred"
+
+
+def _seconds_since(iso_timestamp: str) -> float:
+    """Wall seconds since an ISO-8601 UTC stamp (for ``e2e_latency_ms``)."""
+    return (datetime.now(UTC) - datetime.fromisoformat(iso_timestamp)).total_seconds()
 
 
 class DeferralSink(Protocol):
@@ -69,6 +75,99 @@ class CallAcceptance:
     duplicate: bool
     dlq_id: int | None = None
     deferred_pending: int | None = None
+
+
+# Per-row replay status (SPECS §7.2). ``replayed`` is terminal; ``pending``
+# means the event failed again and stays actionable; ``missing``/``not_claimed``
+# are refusals, never state changes.
+ReplayStatus = str  # "replayed" | "pending" | "deferred" | "missing" | "not_claimed"
+
+# Outcomes recorded on the dead-letter row when a replay succeeds vs fails
+# again (SPECS §7.2 "replay_outcome: processed | failed (with reason)").
+_REPLAY_OUTCOME_FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class ReplayResult:
+    """One event's replay attempt, as reported by the API and the CLI."""
+
+    event_id: str
+    dlq_id: int | None
+    status: ReplayStatus
+    reason: str | None = None
+    attempts: int = 0
+    retry_count: int = 0
+
+    @property
+    def succeeded(self) -> bool:
+        """Terminal success is ``replayed``; a breaker refusal is not a result."""
+        return self.status == "replayed"
+
+    def as_body(self) -> dict[str, object]:
+        body: dict[str, object] = {
+            "event_id": self.event_id,
+            "dlq_id": self.dlq_id,
+            "status": self.status,
+            "attempts": self.attempts,
+        }
+        if self.reason is not None:
+            body["reason"] = self.reason
+        return body
+
+
+@dataclass(frozen=True)
+class ReplayReport:
+    """Result of one replay request (SPECS §5 ``POST /admin/dlq/replay``).
+
+    Counters partition ``results`` exactly, so every row the request touched
+    is accounted for:
+
+    - ``attempted`` / ``succeeded`` / ``failed`` — rows that actually went
+      through the resilient boundary, and how they ended
+      (``attempted == succeeded + failed``);
+    - ``deferred`` — the breaker refused the dispatch: no downstream call, no
+      state change, the row stays pending;
+    - ``skipped`` — the row was not replayable at all (unknown ``event_id``, or
+      an event that is no longer ``failed_downstream``). This only happens when
+      the caller names events explicitly, and it is reported rather than
+      dropped so a mistyped id can never look like a successful replay.
+
+    The last two are extensions beyond SPECS §5's four documented keys: the
+    spec's shape has no way to say "nothing was attempted", and an operator
+    needs that distinction to decide whether to retry.
+    """
+
+    results: tuple[ReplayResult, ...] = field(default_factory=tuple)
+
+    @property
+    def attempted(self) -> int:
+        return sum(1 for r in self.results if r.status in ("replayed", "pending"))
+
+    @property
+    def succeeded(self) -> int:
+        return sum(1 for r in self.results if r.status == "replayed")
+
+    @property
+    def failed(self) -> int:
+        return sum(1 for r in self.results if r.status == "pending")
+
+    @property
+    def deferred(self) -> int:
+        return sum(1 for r in self.results if r.status == "deferred")
+
+    @property
+    def skipped(self) -> int:
+        return sum(1 for r in self.results if r.status in ("missing", "not_claimed"))
+
+    def as_body(self) -> dict[str, object]:
+        return {
+            "attempted": self.attempted,
+            "succeeded": self.succeeded,
+            "failed": self.failed,
+            "deferred": self.deferred,
+            "skipped": self.skipped,
+            "results": [r.as_body() for r in self.results],
+        }
 
 
 class CallService:
@@ -361,6 +460,232 @@ class CallService:
         if dlq_id is not None:
             self._refresh_dlq_gauge()
         return "processed" if result.ok else "failed"
+
+    # --- replay (M4-T03; SPECS §7.2) ---------------------------------------
+
+    async def replay(
+        self,
+        *,
+        limit: int = 50,
+        event_ids: list[str] | None = None,
+    ) -> ReplayReport:
+        """Re-submit pending dead letters through the resilient boundary.
+
+        SPECS §7.2, all of which this path enforces:
+
+        - **Same boundary, no shortcut:** dispatch is :meth:`_dispatch`, so
+          retries, the per-attempt timeout and breaker admission all apply. A
+          breaker that refuses the call leaves the row ``pending`` with the
+          event untouched — replay is never a way around the breaker.
+        - **Bypasses the public idempotency short-circuit:** :meth:`accept`
+          is *not* consulted. The event already has a ``call_events`` row, and
+          looking it up would answer "duplicate" instead of re-processing —
+          which is the whole point of an authorized replay. Rows are updated
+          **in place**: no new ``call_events`` row and no new dead-letter row,
+          ever (the UNIQUE ``event_id`` makes a duplicate row impossible by
+          construction).
+        - **Success** → event ``processed`` + DLQ row ``replayed`` with
+          ``replay_outcome`` and ``replay_event_id`` (one transaction).
+        - **Failure** → the existing row is updated (reason, attempts,
+          ``last_failed_at``; ``first_failed_at`` preserved) and stays
+          ``pending``.
+
+        Claims make concurrent replays safe: :func:`store.claim_event_for_replay`
+        is a conditional ``failed_downstream → processing`` UPDATE, so two
+        replays of one event can never both process it.
+
+        When the caller names ``event_ids``, any id that has no pending
+        dead-letter row is reported as ``missing`` instead of being dropped:
+        the operator asked for those events by name and is owed an answer.
+        """
+        rows = store.select_replayable(self._conn, limit=limit, event_ids=event_ids)
+        results: list[ReplayResult] = [
+            await self._replay_one(row["event_id"], int(row["id"])) for row in rows
+        ]
+        if event_ids:
+            found = {row["event_id"] for row in rows}
+            results.extend(
+                ReplayResult(event_id, None, "missing")
+                for event_id in dict.fromkeys(event_ids)
+                if event_id not in found
+            )
+        return ReplayReport(results=tuple(results))
+
+    async def _replay_one(self, event_id: str, dlq_id: int) -> ReplayResult:
+        if not store.claim_event_for_replay(self._conn, event_id):
+            # Another replay (HTTP, CLI, a second process) owns it, or the
+            # event is no longer failed_downstream. Change nothing.
+            return ReplayResult(event_id, dlq_id, "not_claimed")
+
+        row = store.get_event(self._conn, event_id)
+        if row is None:  # pragma: no cover - FK guarantees the event exists
+            return ReplayResult(event_id, dlq_id, "missing")
+
+        self._metrics.in_flight_calls.inc()
+        try:
+            outcome = await self._dispatch(event_id)
+        except asyncio.CancelledError:
+            # Same reasoning as the drain path: a cancelled replay (client
+            # disconnect, shutdown) must return the claim, not strand it.
+            self._release_replay_claim(event_id)
+            raise
+        except Exception:
+            self._release_replay_claim(event_id)
+            raise
+        finally:
+            self._metrics.in_flight_calls.dec()
+
+        if outcome.deferred:
+            # The breaker refused: no downstream evidence, no status change.
+            # The claim goes back so the row remains replayable later.
+            self._release_replay_claim(event_id)
+            self._metrics.dlq_replays_total.labels(result="deferred").inc()
+            return ReplayResult(event_id, dlq_id, "deferred", reason=outcome.reason)
+
+        if outcome.result.ok:
+            self._complete_replay(event_id, dlq_id, outcome)
+            self._metrics.dlq_replays_total.labels(result="success").inc()
+            self._refresh_dlq_gauge()
+            return ReplayResult(
+                event_id,
+                dlq_id,
+                "replayed",
+                attempts=outcome.attempts,
+                retry_count=outcome.retry_count,
+            )
+
+        self._fail_replay(event_id, dlq_id, outcome)
+        self._metrics.dlq_replays_total.labels(result="failed").inc()
+        self._refresh_dlq_gauge()
+        return ReplayResult(
+            event_id,
+            dlq_id,
+            "pending",
+            reason=outcome.result.reason,
+            attempts=outcome.attempts,
+            retry_count=outcome.retry_count,
+        )
+
+    def _complete_replay(self, event_id: str, dlq_id: int, outcome: RetryOutcome) -> None:
+        """Success: event terminal + DLQ ``replayed`` in ONE transaction."""
+        ptp_taken = self._ptp_draw.random() < self._settings.success_ptp_rate
+        event_outcome = EventOutcome.PTP_TAKEN if ptp_taken else EventOutcome.CONNECTED
+        row = store.get_event(self._conn, event_id)
+        if row is None:  # pragma: no cover - claim implies the row exists
+            return
+        now = self._now()
+        # ``replay_event_id`` links the replay to the event it re-processed
+        # (SPECS §7 ``replay_event_id``) — the same id, because replay updates
+        # the original event in place rather than creating a new one.
+        replay_event_id = event_id
+        e2e_latency_ms = _seconds_since(row["created_at"]) * 1000
+        pipeline_latency_ms = (
+            None if outcome.result.latency_ms is None else round(outcome.result.latency_ms)
+        )
+        # Cumulative accounting, exactly as the failure path: ``attempts`` and
+        # ``retry_count`` describe the event's whole lifecycle, so the success
+        # row must add the replay's attempts to what the event already burned
+        # (SPECS §3/§5: retry_count == attempts - 1 always holds).
+        total_attempts = int(row["attempts"]) + outcome.attempts
+        total_retries = max(0, total_attempts - 1)
+        with store.begin_immediate(self._conn):
+            store.update_event_terminal(
+                self._conn,
+                event_id,
+                status="processed",
+                outcome=event_outcome.value,
+                attempts=total_attempts,
+                retry_count=total_retries,
+                pipeline_latency_ms=pipeline_latency_ms,
+                e2e_latency_ms=e2e_latency_ms,
+                failure_reason=None,
+                updated_at=now,
+            )
+            store.mark_replayed(
+                self._conn,
+                dlq_id,
+                replayed_at=now,
+                replay_outcome="processed",
+                replay_event_id=replay_event_id,
+                attempts=total_attempts,
+                retry_count=total_retries,
+            )
+            # Keep the reverse link: the row keeps pointing at its DLQ history
+            # (SPECS §7.2 "the dlq_id link is kept").
+            store.set_dlq_link(self._conn, event_id, dlq_id)
+        self._metrics.calls_total.labels(
+            outcome=event_outcome.value, status="processed"
+        ).inc()
+        self._metrics.e2e_latency_ms.observe(e2e_latency_ms)
+        log_event(
+            logger,
+            "dlq_replay",
+            event_id=event_id,
+            dlq_id=dlq_id,
+            result="replayed",
+            outcome=event_outcome.value,
+            attempts=outcome.attempts,
+        )
+
+    def _fail_replay(self, event_id: str, dlq_id: int, outcome: RetryOutcome) -> None:
+        """Failure: event back to ``failed_downstream``, DLQ row updated in place."""
+        reason = outcome.result.reason or "non_retryable_error"
+        now = self._now()
+        row = store.get_event(self._conn, event_id)
+        if row is None:  # pragma: no cover - claim implies the row exists
+            return
+        # Cumulative accounting, same rule as the deferral path: replay
+        # attempts add to what the event already burned.
+        total_attempts = int(row["attempts"]) + outcome.attempts
+        total_retries = max(0, total_attempts - 1)
+        e2e_latency_ms = _seconds_since(row["created_at"]) * 1000
+        with store.begin_immediate(self._conn):
+            store.update_event_terminal(
+                self._conn,
+                event_id,
+                status="failed_downstream",
+                outcome=EventOutcome.FAILED_DOWNSTREAM.value,
+                attempts=total_attempts,
+                retry_count=total_retries,
+                pipeline_latency_ms=None,
+                e2e_latency_ms=e2e_latency_ms,
+                failure_reason=reason,
+                updated_at=now,
+            )
+            store.refresh_dead_letter(
+                self._conn,
+                dlq_id,
+                reason=reason,
+                attempts=total_attempts,
+                retry_count=total_retries,
+                last_failed_at=now,
+            )
+        self._metrics.calls_total.labels(
+            outcome=EventOutcome.FAILED_DOWNSTREAM.value, status="failed_downstream"
+        ).inc()
+        log_event(
+            logger,
+            "dlq_replay",
+            event_id=event_id,
+            dlq_id=dlq_id,
+            result=_REPLAY_OUTCOME_FAILED,
+            reason=reason,
+            attempts=outcome.attempts,
+        )
+
+    def _release_replay_claim(self, event_id: str) -> None:
+        """Return a claimed replay row to ``failed_downstream``.
+
+        Conditional on ``processing``, so a replay that already finalized is
+        never resurrected. Synchronous (no ``await``), so it completes even
+        while the calling task is being cancelled.
+        """
+        with store.begin_immediate(self._conn):
+            self._conn.execute(
+                "UPDATE call_events SET status = 'failed_downstream'"
+                " WHERE event_id = ? AND status = 'processing'",
+                (event_id,),
+            )
 
     # --- internals ---------------------------------------------------------
 

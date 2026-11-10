@@ -338,6 +338,31 @@ def count_deferred(conn: sqlite3.Connection) -> int:
     return int(row["n"])
 
 
+def claim_event_for_replay(
+    conn: sqlite3.Connection, event_id: str, *, updated_at: str | None = None
+) -> bool:
+    """Atomically flip ``failed_downstream → processing``; ``True`` iff won.
+
+    The replay counterpart of :func:`claim_deferred_event` (SPECS §7.2). A
+    dead-letter row is only actionable while its event is ``failed_downstream``,
+    so the same conditional-UPDATE trick makes concurrent replays — two HTTP
+    requests, or the CLI racing a server — structurally unable to process one
+    event twice (M4-T04 acceptance).
+
+    A successful or failed replay moves the row to ``processed`` or back to
+    ``failed_downstream``, so the predicate is exhausted either way; an
+    already-replayed event can never be claimed again.
+    """
+    stamp = updated_at or datetime.now(UTC).isoformat()
+    with begin_immediate(conn):
+        cur = conn.execute(
+            "UPDATE call_events SET status = ?, updated_at = ?"
+            " WHERE event_id = ? AND status = ?",
+            (_PROCESSING, stamp, event_id, "failed_downstream"),
+        )
+    return cur.rowcount == 1
+
+
 def count_active_events(conn: sqlite3.Connection) -> int:
     """Events in a non-terminal state (``deferred`` or ``processing``)."""
     row = conn.execute(
@@ -345,6 +370,18 @@ def count_active_events(conn: sqlite3.Connection) -> int:
         (_DEFERRED, _PROCESSING),
     ).fetchone()
     return int(row["n"])
+
+
+def count_events_by_status(conn: sqlite3.Connection) -> dict[str, int]:
+    """Event counts per status, every state present (the ``/stats`` body).
+
+    All four statuses are always returned — a zero is information ("nothing
+    is deferred"), and a missing key forces every consumer to special-case it.
+    """
+    counts = {"deferred": 0, "processing": 0, "processed": 0, "failed_downstream": 0}
+    for row in conn.execute("SELECT status, COUNT(*) AS n FROM call_events GROUP BY status"):
+        counts[row["status"]] = int(row["n"])
+    return counts
 
 
 # --- dead-letter operations (M3-T20; SPECS §7) ------------------------------
@@ -463,6 +500,98 @@ def list_dead_letters(
 def get_dead_letter(conn: sqlite3.Connection, dlq_id: int) -> sqlite3.Row | None:
     """Fetch one dead-letter row (or ``None``)."""
     return conn.execute("SELECT * FROM dead_letter WHERE id = ?", (dlq_id,)).fetchone()
+
+
+def select_replayable(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    event_ids: list[str] | None = None,
+) -> list[sqlite3.Row]:
+    """Pending dead letters eligible for replay (SPECS §7.2).
+
+    ``event_ids`` selects exactly those events (the operator named them), so a
+    request for an id that is not pending is reported rather than silently
+    skipped. Without it, the oldest pending rows come first — replay drains
+    the backlog in failure order.
+    """
+    if event_ids is not None:
+        if not event_ids:
+            return []
+        placeholders = ",".join("?" for _ in event_ids)
+        return list(
+            conn.execute(
+                f"SELECT * FROM dead_letter WHERE status = 'pending'"
+                f" AND event_id IN ({placeholders}) ORDER BY id ASC",
+                tuple(event_ids),
+            )
+        )
+    return list(
+        conn.execute(
+            "SELECT * FROM dead_letter WHERE status = 'pending' ORDER BY id ASC LIMIT ?",
+            (limit,),
+        )
+    )
+
+
+def mark_replayed(
+    conn: sqlite3.Connection,
+    dlq_id: int,
+    *,
+    replayed_at: str,
+    replay_outcome: str,
+    replay_event_id: str,
+    attempts: int | None = None,
+    retry_count: int | None = None,
+) -> None:
+    """Mark a dead letter ``replayed`` with its outcome (SPECS §7).
+
+    The caller owns the transaction: replay completion commits the event's
+    terminal flip and this marker together, exactly as the failure path does.
+
+    ``attempts``/``retry_count`` are supplied when the caller keeps cumulative
+    lifecycle accounting (as :meth:`app.service.CallService.replay` does), so
+    the dead-letter row and its event row never disagree about how much work
+    the event cost in total. Omitted, the row's historical failure counts are
+    preserved.
+    """
+    if attempts is None or retry_count is None:
+        conn.execute(
+            "UPDATE dead_letter SET status = 'replayed', replayed_at = ?,"
+            " replay_outcome = ?, replay_event_id = ? WHERE id = ?",
+            (replayed_at, replay_outcome, replay_event_id, dlq_id),
+        )
+        return
+    conn.execute(
+        "UPDATE dead_letter SET status = 'replayed', replayed_at = ?,"
+        " replay_outcome = ?, replay_event_id = ?, attempts = ?, retry_count = ?"
+        " WHERE id = ?",
+        (replayed_at, replay_outcome, replay_event_id, attempts, retry_count, dlq_id),
+    )
+
+
+def refresh_dead_letter(
+    conn: sqlite3.Connection,
+    dlq_id: int,
+    *,
+    reason: str,
+    attempts: int,
+    retry_count: int,
+    last_failed_at: str,
+) -> None:
+    """Update a still-pending dead letter after a failed replay (SPECS §7.2).
+
+    ``first_failed_at`` is preserved — it is the event's original death
+    timestamp, not the latest attempt's. No new row is ever created: the
+    UNIQUE ``event_id`` and this UPDATE are the no-duplicate guarantee.
+    """
+    if reason not in DEAD_LETTER_REASONS:
+        raise ValueError(f"unknown dead-letter reason: {reason!r}")
+    conn.execute(
+        "UPDATE dead_letter SET reason = ?, attempts = ?, retry_count = ?,"
+        " last_failed_at = ?, status = 'pending' WHERE id = ?",
+        (reason, attempts, retry_count, last_failed_at, dlq_id),
+    )
 
 
 def count_dead_letters(conn: sqlite3.Connection) -> dict[str, int]:

@@ -11,7 +11,7 @@ else
   PY := $(if $(wildcard $(VENV_PY)),$(VENV_PY),python3)
 endif
 
-.PHONY: up down logs test lint calibration-report demo dlq-replay
+.PHONY: up down logs test lint calibration-report demo dlq-list dlq-replay stats
 
 ## up: build and start the compose stack (inference + mock)
 up:
@@ -42,6 +42,14 @@ calibration-report:
 demo:
 	@echo "make demo: not implemented until Sprint 6 (traffic generator, milestone M5)"; exit 1
 
-## dlq-replay: replay dead-letter rows (placeholder until Sprint 5)
+## dlq-list: list pending dead letters without HTTP (SPECS §2)
+dlq-list:
+	$(PY) -m app.cli dlq list
+
+## dlq-replay: replay dead-letter rows (HTTP-free path, SPECS §2/§7.2)
 dlq-replay:
-	@echo "make dlq-replay: not implemented until Sprint 5 (DLQ inspect/replay, milestone M4)"; exit 1
+	$(PY) -m app.cli dlq replay --limit 50
+
+## stats: durable event/dead-letter counts from the store (HTTP-free)
+stats:
+	$(PY) -m app.cli stats

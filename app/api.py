@@ -8,34 +8,31 @@
 - ``GET /admin/dlq`` / ``GET /admin/dlq/{id}`` — dead-letter inspection
   (M4-T01): the full §7 row with ``event_json`` parsed under ``event``, so a
   reviewer never has to open SQLite to see why an event died;
+- ``POST /admin/dlq/replay`` — re-submit pending dead letters through the
+  same resilient boundary (M4-T04, §7.2);
+- ``GET /stats`` — durable counts + breaker state for operators (M4-T02/§9);
 - errors use the ``{"detail": ...}`` envelope.
+
+Payload shapes and the stats body live in :mod:`app.reporting` so the CLI
+(``python -m app.cli``) renders exactly the same data (SPECS §2).
 """
 
 from __future__ import annotations
 
 import json
+import time
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
+from pydantic import BaseModel, Field
 
 from app import store
 from app.models import CallEvent
+from app.reporting import record_payload, stats_body
 from app.resilience.circuit_breaker import CircuitBreaker
-from app.service import CallAcceptance, CallService
+from app.service import CallAcceptance, CallService, ReplayReport
 
 router = APIRouter()
-
-
-def _record_payload(row) -> dict[str, object]:
-    """Stored row → response record; ``event_json`` parsed under ``event``.
-
-    Every column of the row is returned, which is what makes the DLQ surfaces
-    (``reason``, ``attempts``, ``retry_count``, both failure timestamps, replay
-    fields) complete per SPECS §7 without a second serialization path.
-    """
-    record = dict(row)
-    record["event"] = json.loads(record.pop("event_json"))
-    return record
 
 
 @router.post("/calls")
@@ -47,7 +44,7 @@ async def submit_call(request: Request, event: CallEvent) -> Response:
         row = store.get_event(request.app.state.conn, acceptance.event_id)
         if row is None:  # pragma: no cover - duplicate implies an existing row
             raise HTTPException(status_code=500, detail="duplicate event record missing")
-        return _json(_record_payload(row) | {"duplicate": True}, status_code=200)
+        return _json(record_payload(row) | {"duplicate": True}, status_code=200)
 
     if acceptance.status == "deferred":
         # Accepted, not completed (SPECS §5 / refinement B). The row was
@@ -82,7 +79,7 @@ async def get_call(event_id: str, request: Request) -> dict[str, object]:
     row = store.get_event(request.app.state.conn, event_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"unknown event_id: {event_id}")
-    return _record_payload(row)
+    return record_payload(row)
 
 
 @router.get("/metrics")
@@ -123,7 +120,7 @@ async def list_dead_letters(
     DLQ.
     """
     rows = store.list_dead_letters(request.app.state.conn, status=status, limit=limit)
-    return [_record_payload(row) for row in rows]
+    return [record_payload(row) for row in rows]
 
 
 @router.get("/admin/dlq/{dlq_id}")
@@ -132,7 +129,50 @@ async def get_dead_letter(dlq_id: int, request: Request) -> dict[str, object]:
     row = store.get_dead_letter(request.app.state.conn, dlq_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"unknown dlq_id: {dlq_id}")
-    return _record_payload(row)
+    return record_payload(row)
+
+
+class ReplayRequest(BaseModel):
+    """``POST /admin/dlq/replay`` body (SPECS §5); both fields optional."""
+
+    limit: int = Field(default=50, ge=1, le=1000)
+    event_ids: list[str] = Field(default_factory=list)
+
+
+@router.post("/admin/dlq/replay")
+async def replay_dead_letters(request: Request, body: ReplayRequest | None = None) -> dict[str, object]:
+    """Replay pending dead letters through the resilient boundary (M4-T04).
+
+    Delegates entirely to :meth:`CallService.replay`, the same code path the
+    CLI uses (SPECS §2: no logic duplication between surfaces). Rows the
+    breaker refuses make no downstream call and are reported as ``deferred``
+    rather than counted as attempted (SPECS §7.2).
+    """
+    payload = body or ReplayRequest()
+    report: ReplayReport = await request.app.state.service.replay(
+        limit=payload.limit,
+        event_ids=payload.event_ids or None,
+    )
+    return report.as_body()
+
+
+@router.get("/stats")
+async def stats(request: Request) -> dict[str, object]:
+    """Run summary for operators and the traffic generator (SPECS §5, §9).
+
+    Assembled from the authoritative store (statuses, DLQ states, deferral
+    depth) and the live breaker, not from in-process counters that would
+    reset on restart. ``latency_percentiles`` are read from the Prometheus
+    histograms, so they reflect every processed event since boot — and reset
+    with the process, which is stated in the field docs.
+    """
+    breaker: CircuitBreaker = request.app.state.breaker
+    return stats_body(
+        request.app.state.conn,
+        request.app.state.metrics,
+        breaker=breaker,
+        uptime_s=round(time.monotonic() - request.app.state.started_at, 1),
+    )
 
 
 def _json(body: dict[str, object], *, status_code: int) -> Response:
