@@ -6,9 +6,9 @@ each run and refresh this file).
 
 | percentile | measured (ms) | target (ms) | band | verdict |
 |---|---|---|---|---|
-| p50 | 300.0 | 300 | ±10% | PASS |
-| p90 | 665.3 | 700 | ±15% | PASS |
-| p99 | 1287.3 | 1200 | ±25% | PASS |
+| p50 | 298.4 | 300 | ±10% | PASS |
+| p90 | 660.7 | 700 | ±15% | PASS |
+| p99 | 1254.7 | 1200 | ±25% | PASS |
 
 Shipped default `LATENCY_SIGMA=0.62` (mu=5.7) — the calibrated
 approximation sanctioned by Appendix B's "adjust sigma if needed"
