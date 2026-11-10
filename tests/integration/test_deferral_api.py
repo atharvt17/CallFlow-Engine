@@ -256,6 +256,68 @@ async def test_drain_leaves_events_deferred_while_breaker_open(api_stack) -> Non
         await stack.aclose()
 
 
+async def test_cancelled_drain_request_releases_claim_while_app_runs(api_stack) -> None:
+    """Client disconnect on a manual drain must not strand the event.
+
+    The app keeps running, so startup recovery never runs. The cancellation
+    has to hand the claim back itself.
+    """
+    from app.pipeline.base import PipelineResult
+
+    class BlockingBackend:
+        def __init__(self) -> None:
+            self.failing = True
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def aclose(self) -> None:
+            pass
+
+        async def process(self, event_id: str, audio_ref: str):
+            if self.failing:
+                return PipelineResult(
+                    ok=False, reason="downstream_timeout", http_status=503, latency_ms=5.0
+                )
+            self.started.set()
+            await self.release.wait()
+            return PipelineResult(ok=True, http_status=200, latency_ms=5.0)
+
+    backend = BlockingBackend()
+    stack = api_stack(1.0, backend=backend, cb_cooldown_s=0.05)
+    try:
+        for _ in range(5):
+            await stack.client.post("/calls", json=event_payload())
+        assert stack.app.state.breaker.state is CircuitState.OPEN
+
+        event_id = str(uuid4())
+        assert (
+            await stack.client.post("/calls", json=event_payload(event_id))
+        ).status_code == 202
+        backend.failing = False
+        await stack.wait_for_half_open()
+
+        # Drain, then abandon the request client-side — exactly a disconnect.
+        task = asyncio.create_task(stack.client.post("/admin/deferred/drain"))
+        await backend.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # No restart happened, yet the row is not stranded.
+        record = (await stack.client.get(f"/calls/{event_id}")).json()
+        assert record["status"] == "deferred"
+        assert stack.app.state.deferral.pending_count() == 1
+        assert (await stack.client.get("/healthz")).json()["deferred_pending"] == 1
+
+        # The live process recovers on the next drain without any restart.
+        backend.release.set()
+        body = (await stack.client.post("/admin/deferred/drain")).json()
+        assert body == {"drained": 1, "succeeded": 1, "failed": 0}
+        assert (await stack.client.get(f"/calls/{event_id}")).json()["status"] == "processed"
+    finally:
+        await stack.aclose()
+
+
 async def test_lifespan_drainer_recovers_without_operator_action(tmp_path) -> None:
     """M3-T21: the background drainer drains the queue on its own.
 

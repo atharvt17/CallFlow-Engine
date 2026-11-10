@@ -7,6 +7,7 @@ injected; no test sleeps.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -488,4 +489,116 @@ async def test_attempt_accounting_is_cumulative_across_deferral(tmp_db) -> None:
     assert row["status"] == "processed"
     assert row["attempts"] == 3, "2 attempts before deferral + 1 after recovery"
     assert row["retry_count"] == row["attempts"] - 1
+
+
+# --- M3-T27: cancellation must never strand a claim -------------------------
+
+
+class BlockingBackend:
+    """Dispatch that blocks until released, then succeeds.
+
+    Used to cancel a drain *mid-flight*, which is what a client disconnect on
+    ``POST /admin/deferred/drain`` produces while the app keeps running.
+    """
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.dispatches = 0
+
+    async def aclose(self) -> None:
+        pass
+
+    async def execute(self, event_id: str, audio_ref: str) -> RetryOutcome:
+        self.dispatches += 1
+        self.started.set()
+        await self.release.wait()
+        return RetryOutcome(
+            result=PipelineResult(ok=True, http_status=200, latency_ms=5.0), attempts=1
+        )
+
+    async def process(self, event_id: str, audio_ref: str) -> PipelineResult:
+        return (await self.execute(event_id, audio_ref)).result
+
+
+class CancelOnSecondDispatchBackend:
+    """Succeeds for the first event, blocks forever for the second."""
+
+    def __init__(self) -> None:
+        self.dispatches = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def aclose(self) -> None:
+        pass
+
+    async def execute(self, event_id: str, audio_ref: str) -> RetryOutcome:
+        self.dispatches += 1
+        if self.dispatches >= 2:
+            self.started.set()
+            await self.release.wait()
+        return RetryOutcome(
+            result=PipelineResult(ok=True, http_status=200, latency_ms=5.0), attempts=1
+        )
+
+    async def process(self, event_id: str, audio_ref: str) -> PipelineResult:
+        return (await self.execute(event_id, audio_ref)).result
+
+
+async def test_cancelled_drain_returns_the_inflight_claim(tmp_db) -> None:
+    """A cancelled manual drain releases its claim *without* a restart.
+
+    Regression for the client-disconnect case: the app keeps running, so
+    startup recovery will never run. The claimed row must go back to
+    ``deferred`` (and back on the queue) before ``CancelledError`` propagates.
+    """
+    backend = BlockingBackend()
+    queue, service = make_queue(tmp_db, backend, Settings())
+    service.bind_deferral(queue)
+    event_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    seed_deferred(tmp_db, event_id)
+    queue.recover()
+
+    task = asyncio.create_task(queue.drain_once(now=NOW))
+    await backend.started.wait()
+    # Mid-flight: the row is claimed, so it is `processing` right now.
+    assert store.get_event(tmp_db, event_id)["status"] == "processing"
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    row = store.get_event(tmp_db, event_id)
+    assert row["status"] == "deferred", "claim released without a restart"
+    assert queue.peek_all() == [event_id], "returned to the FIFO head"
+    assert queue.pending_count() == 1
+
+    # The live app can now make progress: a later pass processes it.
+    backend.release.set()
+    report = await queue.drain_once(now=NOW)
+    assert (report.drained, report.succeeded) == (1, 1)
+    assert store.get_event(tmp_db, event_id)["status"] == "processed"
+
+
+async def test_cancelled_drain_never_strands_other_queued_events(tmp_db) -> None:
+    """The event being cancelled is released; the untouched backlog is intact."""
+    backend = CancelOnSecondDispatchBackend()
+    queue, service = make_queue(tmp_db, backend, Settings())
+    service.bind_deferral(queue)
+    ids = [f"d{i}000000-0000-4000-8000-000000000000" for i in range(3)]
+    for event_id in ids:
+        seed_deferred(tmp_db, event_id)
+    queue.recover()
+
+    task = asyncio.create_task(queue.drain_once(now=NOW))
+    await backend.started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    statuses = {event_id: store.get_event(tmp_db, event_id)["status"] for event_id in ids}
+    assert statuses[ids[0]] == "processed", "committed work survives the cancellation"
+    assert statuses[ids[1]] == "deferred", "the interrupted claim is released"
+    assert statuses[ids[2]] == "deferred", "the untouched backlog is still pending"
+    assert queue.peek_all() == ids[1:], "queue matches the durable state, in order"
 

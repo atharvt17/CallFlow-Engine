@@ -26,8 +26,23 @@ Concurrency model: the FIFO mutators (:meth:`enqueue`, :meth:`top_up_from_db`)
 are synchronous and never ``await`` mid-mutation, so on a single asyncio event
 loop each is atomic and needs no lock. Drain passes, which do await dispatch,
 serialize on :attr:`_drain_lock`; the database side is serialized by SQLite's
-``BEGIN IMMEDIATE`` writer lock. A cancelled drainer leaves at most its
-in-flight event ``processing`` — recovered as an orphan on the next boot.
+``BEGIN IMMEDIATE`` writer lock.
+
+Cancellation is claim-safe. A cancelled drain — most importantly a client
+disconnect on ``POST /admin/deferred/drain`` while the application keeps
+running — returns its in-flight row to ``deferred`` and re-raises. Relying on
+startup recovery alone would be wrong for request-scoped cancellation: no
+restart is coming, so the row would sit in ``processing`` indefinitely. Only a
+hard-killed process leaves a ``processing`` orphan, and that is what startup
+recovery is for.
+
+**Scope: one process per database file.** The conditional claim is what makes
+concurrent drainers safe, and SQLite's writer lock makes it correct across
+threads and across processes that share a local file. It does *not* make a
+single SQLite file safe to share over a network filesystem: WAL depends on
+POSIX/Windows file-locking semantics that NFS/SMB do not reliably provide. A
+multi-*host* deployment needs a server-class database (or one database per
+replica); Round 1 is deliberately single-process (PLAN D5).
 """
 
 from __future__ import annotations
@@ -174,6 +189,14 @@ class DeferralQueue:
         FIFO head and ends the pass: every remaining item would produce the
         same refusal, so churning through them is pointless. The row stays
         ``deferred`` in SQLite regardless.
+
+        Cancellation releases the in-flight claim **before** propagating.
+        ``CancelledError`` derives from ``BaseException``, so it is not caught
+        by the ``except Exception`` below; without an explicit handler a client
+        disconnect on ``POST /admin/deferred/drain`` would leave the row
+        ``processing`` until the next restart — and the application is still
+        running, so no recovery pass is coming. The release is synchronous and
+        cannot itself yield, so it completes even under cancellation.
         """
         async with self._drain_lock:
             drained = succeeded = failed = 0
@@ -190,20 +213,20 @@ class DeferralQueue:
                     outcome = await self._service.process_deferred(
                         event_id, now=now if now is not None else self._clock()
                     )
+                except asyncio.CancelledError:
+                    # Request-scoped cancellation (client disconnect) or
+                    # shutdown. Hand the claim back so this very process can
+                    # retry it; a shutdown cancels the drainer, not this task.
+                    self._release_claim(event_id)
+                    logger.warning("drain cancelled; claim returned to deferred")
+                    raise
                 except Exception:
                     # Never leave a claimed row stranded in ``processing``: an
                     # unexpected error returns it to ``deferred`` (the claim is
                     # released) and the next pass retries it. Restart recovery
                     # would also catch it, but only after a restart.
                     logger.exception("deferred dispatch failed; returning to queue")
-                    with store.begin_immediate(self._conn):
-                        self._conn.execute(
-                            "UPDATE call_events SET status = 'deferred'"
-                            " WHERE event_id = ? AND status = 'processing'",
-                            (event_id,),
-                        )
-                    self._items.appendleft(event_id)
-                    self._publish_gauges()
+                    self._release_claim(event_id)
                     raise
                 # ``drained`` counts work attempted this pass; ``succeeded`` /
                 # ``failed`` are the terminal subset. An event the breaker
@@ -240,6 +263,24 @@ class DeferralQueue:
                 continue
 
     # --- observability ------------------------------------------------------
+
+    def _release_claim(self, event_id: str) -> None:
+        """Return a claimed row to ``deferred`` and put it back on the FIFO head.
+
+        One conditional UPDATE, so a claim that already finalized (``processed``
+        / ``failed_downstream``) is never resurrected. Synchronous by design:
+        it contains no ``await``, so it runs to completion even while the
+        surrounding task is being cancelled.
+        """
+        with store.begin_immediate(self._conn):
+            self._conn.execute(
+                "UPDATE call_events SET status = 'deferred'"
+                " WHERE event_id = ? AND status = 'processing'",
+                (event_id,),
+            )
+        if event_id not in self._items:
+            self._items.appendleft(event_id)
+        self._publish_gauges()
 
     def _publish_gauges(self) -> None:
         """Publish ``deferred_pending`` (DB) and ``deferred_queue_depth`` (FIFO)."""
