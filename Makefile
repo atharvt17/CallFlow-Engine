@@ -11,7 +11,7 @@ else
   PY := $(if $(wildcard $(VENV_PY)),$(VENV_PY),python3)
 endif
 
-.PHONY: up down logs test lint demo dlq-replay
+.PHONY: up down logs test lint calibration-report demo dlq-replay
 
 ## up: build and start the compose stack (inference + mock)
 up:
@@ -32,6 +32,11 @@ test:
 ## lint: run ruff (prefers the project venv; falls back to PATH python)
 lint:
 	$(PY) -m ruff check .
+
+## calibration-report: regenerate reports/latency_calibration.md (intentional)
+## The test suite asserts the same bands read-only; only this target writes.
+calibration-report:
+	$(PY) -m tools.calibration_report
 
 ## demo: compressed Appendix C day replay (placeholder until Sprint 6)
 demo:
