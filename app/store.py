@@ -18,6 +18,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -265,7 +266,100 @@ def update_event_terminal(
     )
 
 
-# --- dead-letter operations (signature stubs — implemented in M3-T20) -------
+# --- deferral queue operations (M3-T18, M3-T19; SPECS §6.3) -----------------
+
+_DEFERRED = "deferred"
+_PROCESSING = "processing"
+
+
+def claim_deferred_event(
+    conn: sqlite3.Connection, event_id: str, *, updated_at: str | None = None
+) -> bool:
+    """Atomically flip ``deferred → processing``; ``True`` iff this claim won.
+
+    One ``BEGIN IMMEDIATE`` transaction around a conditional UPDATE: SQLite
+    serializes writers, and the ``status = 'deferred'`` predicate means only
+    the first claimant of an event transitions a row. A second claim — from
+    another drainer pass, another task, or another process — matches zero
+    rows and returns ``False``, so duplicate processing is structurally
+    impossible (SPECS §6.3, M3-T18).
+    """
+    stamp = updated_at or datetime.now(UTC).isoformat()
+    with begin_immediate(conn):
+        cur = conn.execute(
+            "UPDATE call_events SET status = ?, updated_at = ?"
+            " WHERE event_id = ? AND status = ?",
+            (_PROCESSING, stamp, event_id, _DEFERRED),
+        )
+    return cur.rowcount == 1
+
+
+def list_deferred_events(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """All ``deferred`` rows in FIFO order (``created_at``, then id)."""
+    return list(
+        conn.execute(
+            "SELECT * FROM call_events WHERE status = ?"
+            " ORDER BY created_at ASC, event_id ASC",
+            (_DEFERRED,),
+        )
+    )
+
+
+def requeue_processing_orphans(conn: sqlite3.Connection) -> list[str]:
+    """Return crash orphans (``processing``) to ``deferred``; IDs in FIFO order.
+
+    A row left ``processing`` means the process died mid-flight, so no one
+    holds a claim on it any more. Requeueing it is safe precisely because the
+    claim is a status flip: the dead process can no longer complete it, and a
+    live one could never have claimed it (the row was not ``deferred``).
+    Idempotent — a second pass over a recovered store returns ``[]``.
+    """
+    with begin_immediate(conn):
+        rows = list(
+            conn.execute(
+                "SELECT event_id FROM call_events WHERE status = ?"
+                " ORDER BY created_at ASC, event_id ASC",
+                (_PROCESSING,),
+            )
+        )
+        if rows:
+            conn.execute(
+                "UPDATE call_events SET status = ?, updated_at = ? WHERE status = ?",
+                (_DEFERRED, datetime.now(UTC).isoformat(), _PROCESSING),
+            )
+    return [row["event_id"] for row in rows]
+
+
+def count_deferred(conn: sqlite3.Connection) -> int:
+    """Deferred events pending in SQLite (the ``deferred_pending`` gauge)."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM call_events WHERE status = ?", (_DEFERRED,)
+    ).fetchone()
+    return int(row["n"])
+
+
+def count_active_events(conn: sqlite3.Connection) -> int:
+    """Events in a non-terminal state (``deferred`` or ``processing``)."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM call_events WHERE status IN (?, ?)",
+        (_DEFERRED, _PROCESSING),
+    ).fetchone()
+    return int(row["n"])
+
+
+# --- dead-letter operations (M3-T20; SPECS §7) ------------------------------
+
+# Full §7.1 reason vocabulary. ``deferred_expired`` is added by M3-T22 on top
+# of the four attempt-level reasons the backend boundary already produces.
+DEAD_LETTER_REASONS = frozenset(
+    {
+        "downstream_timeout",
+        "timeout",
+        "connection_error",
+        "non_retryable_error",
+        "deferred_expired",
+    }
+)
 
 
 def record_dead_letter(
@@ -279,11 +373,70 @@ def record_dead_letter(
     first_failed_at: str,
     last_failed_at: str,
 ) -> int:
-    """Insert-or-update a dead-letter row (M3-T20: transactional with the
-    event's ``failed_downstream`` flip; UNIQUE on ``event_id`` forces an
-    UPDATE of the existing row on repeated failures, preserving
-    ``first_failed_at``)."""
-    raise NotImplementedError("DLQ write path lands in M3-T20")
+    """Insert-or-update the event's single dead-letter row; return its ``id``.
+
+    Must run in the **same transaction** as the event's ``failed_downstream``
+    flip (SPECS §7): the caller owns the :func:`begin_immediate` boundary, so
+    a crash can never leave a failed event without its DLQ entry or a DLQ
+    entry without a failed event.
+
+    ``dead_letter.event_id`` is UNIQUE, so a repeated failure UPDATEs the
+    existing row — refreshing ``reason``/``attempts``/``retry_count``/
+    ``last_failed_at`` while preserving ``first_failed_at`` and the row id
+    (§7.1 + §7.2: repeated replay failures never create duplicates).
+    """
+    if reason not in DEAD_LETTER_REASONS:
+        raise ValueError(f"unknown dead-letter reason: {reason!r}")
+
+    conn.execute(
+        """
+        INSERT INTO dead_letter (
+          event_id, event_json, reason, attempts, retry_count,
+          first_failed_at, last_failed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(event_id) DO UPDATE SET
+          event_json = excluded.event_json,
+          reason = excluded.reason,
+          attempts = excluded.attempts,
+          retry_count = excluded.retry_count,
+          last_failed_at = excluded.last_failed_at,
+          -- A fresh terminal failure leaves the row pending again, even
+          -- if an earlier replay marked it 'replayed'.
+          status = 'pending',
+          replayed_at = NULL,
+          replay_outcome = NULL
+        """,
+        (
+            event_id,
+            event_json,
+            reason,
+            attempts,
+            retry_count,
+            first_failed_at,
+            last_failed_at,
+        ),
+    )
+    dlq_id = int(
+        conn.execute(
+            "SELECT id FROM dead_letter WHERE event_id = ?", (event_id,)
+        ).fetchone()["id"]
+    )
+    # The reverse link commits inside the caller's terminal-failure
+    # transaction, so `failed_downstream ⇒ dlq_id` can never diverge.
+    set_dlq_link(conn, event_id, dlq_id)
+    return dlq_id
+
+
+def set_dlq_link(conn: sqlite3.Connection, event_id: str, dlq_id: int) -> None:
+    """Point ``call_events.dlq_id`` at the event's dead-letter row.
+
+    :func:`record_dead_letter` already does this, so callers inside the
+    terminal-failure transaction never have to remember the reverse link.
+    Exposed for replay (M4), which may re-link after an in-place update.
+    """
+    conn.execute(
+        "UPDATE call_events SET dlq_id = ? WHERE event_id = ?", (dlq_id, event_id)
+    )
 
 
 def list_dead_letters(
@@ -292,5 +445,29 @@ def list_dead_letters(
     status: str | None = None,
     limit: int = 50,
 ) -> list[sqlite3.Row]:
-    """List dead-letter rows (M4 inspection surface; stub until M3-T20)."""
-    raise NotImplementedError("DLQ listing lands in M3-T20")
+    """List dead-letter rows newest-first (M4 inspection surface)."""
+    if status is None:
+        return list(
+            conn.execute(
+                "SELECT * FROM dead_letter ORDER BY id DESC LIMIT ?", (limit,)
+            )
+        )
+    return list(
+        conn.execute(
+            "SELECT * FROM dead_letter WHERE status = ? ORDER BY id DESC LIMIT ?",
+            (status, limit),
+        )
+    )
+
+
+def get_dead_letter(conn: sqlite3.Connection, dlq_id: int) -> sqlite3.Row | None:
+    """Fetch one dead-letter row (or ``None``)."""
+    return conn.execute("SELECT * FROM dead_letter WHERE id = ?", (dlq_id,)).fetchone()
+
+
+def count_dead_letters(conn: sqlite3.Connection) -> dict[str, int]:
+    """DLQ row counts by status (the ``dlq_entries{status}`` gauge)."""
+    counts = {"pending": 0, "replayed": 0}
+    for row in conn.execute("SELECT status, COUNT(*) AS n FROM dead_letter GROUP BY status"):
+        counts[row["status"]] = int(row["n"])
+    return counts

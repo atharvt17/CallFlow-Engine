@@ -118,10 +118,11 @@ async def test_failure_maps_to_failed_downstream(tmp_db) -> None:
     row = store.get_event(tmp_db, str(make_event().event_id))
     assert row is not None
     assert row["status"] == "failed_downstream" and row["failure_reason"] == "downstream_timeout"
-    # M2 staged gap (per TASKS M2-T07 DoD): DLQ row creation lands in M3-T20.
-    assert row["dlq_id"] is None
+    # M3-T20: the terminal failure wrote its DLQ row in the same transaction.
+    assert row["dlq_id"] is not None
+    assert acceptance.dlq_id == row["dlq_id"]
     dlq_count = tmp_db.execute("SELECT COUNT(*) AS n FROM dead_letter").fetchone()["n"]
-    assert dlq_count == 0
+    assert dlq_count == 1
 
 
 async def test_duplicate_short_circuits_without_redispatch(tmp_db) -> None:

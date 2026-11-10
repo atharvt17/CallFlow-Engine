@@ -138,7 +138,8 @@ async def test_forced_total_failure_yields_failed_downstream(make_stack) -> None
         assert body["attempts"] == 3
         assert body["retry_count"] == 2
         assert body["failure_reason"] == "downstream_timeout"
-        assert body["dlq_id"] is None  # M2 staged gap: DLQ write path lands M3-T20
+        # M3-T20: the terminal failure wrote its complete DLQ row.
+        assert isinstance(body["dlq_id"], int)
 
         row = fetch_row(db_path, event_id)
         assert row is not None

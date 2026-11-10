@@ -1,17 +1,20 @@
 """FastAPI application factory for the inference service (M0 skeleton + M2 core).
 
-`GET /healthz` already exposes the SPECS §5 health contract. The circuit
-breaker and deferral components land in Sprints 3–4; until then the health
-endpoint reports placeholder values (``closed`` / ``0``) for their state, as
-prescribed by the M0-T05 task definition.
+`GET /healthz` exposes the SPECS §5 health contract with the live breaker
+state and the durable deferred count (Sprint 4 replaced the M0 placeholders).
 
-Wiring (M2-T08): the store connection, pipeline backend, and call service are
-built eagerly in :func:`create_app` (so ASGI-level tests see complete state
-without lifespan), while cleanup runs in the lifespan shutdown hook.
+Wiring (M2-T08, Sprint 4): the store connection, pipeline backend, call
+service and deferral queue are built eagerly in :func:`create_app` (so
+ASGI-level tests see complete state without lifespan), while the background
+drainer and cleanup run in the lifespan hooks. Startup recovery is also eager:
+the queue is reconstructed from SQLite at factory time, so an app built in a
+test sees its recovered backlog without running lifespan — recovery is
+idempotent, so a second construction against the same file is a no-op.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -24,6 +27,7 @@ from pydantic import BaseModel
 from app import store
 from app.api import router
 from app.config import Settings
+from app.deferral import DeferralQueue
 from app.logging import log_event, setup_logging
 from app.metrics import Metrics
 from app.pipeline import PipelineBackend, create_backend
@@ -33,8 +37,8 @@ from app.service import CallService
 
 logger = logging.getLogger(__name__)
 
-# Placeholder value until deferral exists (Sprint 4).
-_PLACEHOLDER_DEFERRED_PENDING = 0
+# Background drainer cadence (SPECS §6.3: "runs when the breaker closes").
+DRAIN_INTERVAL_S = 1.0
 
 
 class HealthResponse(BaseModel):
@@ -47,7 +51,10 @@ class HealthResponse(BaseModel):
 
 
 def create_app(
-    settings: Settings | None = None, backend: PipelineBackend | None = None
+    settings: Settings | None = None,
+    backend: PipelineBackend | None = None,
+    *,
+    run_drainer: bool = True,
 ) -> FastAPI:
     """Build the inference app; settings and backend injectable for tests."""
     if settings is None:
@@ -64,13 +71,35 @@ def create_app(
         backend, breaker, settings, metrics=metrics
     )
     service = CallService(conn, resilient, settings, metrics)
+    deferral = DeferralQueue(conn, service, settings, metrics)
+    service.bind_deferral(deferral)
+    # Reconstruct the queue from SQLite before the app serves anything
+    # (SPECS §6.3). Idempotent, so eager execution is safe for tests that
+    # never run lifespan.
+    deferral.recover()
     started_at = time.monotonic()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        stop = asyncio.Event()
+        drainer: asyncio.Task[None] | None = None
+        if run_drainer:
+            drainer = asyncio.create_task(
+                deferral.drainer_loop(stop, interval_s=DRAIN_INTERVAL_S),
+                name="deferred-drainer",
+            )
         try:
             yield
         finally:
+            stop.set()
+            if drainer is not None:
+                drainer.cancel()
+                try:
+                    await drainer
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("deferred drainer stopped with an error")
             await backend.aclose()
             conn.close()
 
@@ -83,6 +112,7 @@ def create_app(
     app.state.settings = settings
     app.state.conn = conn
     app.state.service = service
+    app.state.deferral = deferral
     app.state.backend = resilient
     app.state.raw_backend = backend
     app.state.metrics = metrics
@@ -96,7 +126,7 @@ def create_app(
             status="ok",
             uptime_s=time.monotonic() - started_at,
             circuit_state=breaker.state.value,
-            deferred_pending=_PLACEHOLDER_DEFERRED_PENDING,
+            deferred_pending=store.count_deferred(conn),
         )
 
     return app

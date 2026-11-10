@@ -168,12 +168,13 @@ async def test_total_failure_opens_and_fails_fast(resilience_stack) -> None:
 
         requests_before = await stack.mock_requests_total()
         for _ in range(5):
-            body = (await client.post("/calls", json=event_payload())).json()
-            # Sprint 4 persists deferred events and answers 202 with the
-            # circuit_open reason; the signal that lands in this sprint is the
-            # service-side deferred status with zero dispatched attempts.
+            resp = await client.post("/calls", json=event_payload())
+            # Sprint 4 contract (SPECS §5): 202 + circuit_open, no dispatch.
+            assert resp.status_code == 202
+            body = resp.json()
             assert body["status"] == "deferred"
-            assert body["attempts"] == 0
+            assert body["reason"] == "circuit_open"
+            assert set(body) == {"event_id", "status", "reason", "deferred_pending"}
         requests_after = await stack.mock_requests_total()
 
         assert requests_after == requests_before, "open breaker must not dispatch"
@@ -204,7 +205,9 @@ async def test_deferred_events_are_persisted_and_queryable(resilience_stack) -> 
         assert stack.breaker.state is CircuitState.OPEN
 
         event_id = str(uuid4())
-        posted = (await client.post("/calls", json=event_payload(event_id))).json()
+        posted_resp = await client.post("/calls", json=event_payload(event_id))
+        assert posted_resp.status_code == 202
+        posted = posted_resp.json()
         assert posted["status"] == "deferred"
 
         stored = await client.get(f"/calls/{event_id}")
@@ -270,7 +273,10 @@ async def test_dead_endpoint_opens_breaker(tmp_path) -> None:
         pipeline_base_url="http://127.0.0.1:9",  # discard port: refused
         pipeline_timeout_s=0.25,
         backoff_base_ms=0,
-        cb_cooldown_s=COOLDOWN_S,
+        # No recovery is exercised here; a long cooldown keeps the breaker
+        # literally OPEN for the snapshot/metrics assertions (the 0.05 s
+        # cooldown used by the recovery tests can elapse under load).
+        cb_cooldown_s=30.0,
     )
     backend = HttpPipelineClient(settings)
     app = create_app(settings, backend)
@@ -291,9 +297,10 @@ async def test_dead_endpoint_opens_breaker(tmp_path) -> None:
 
             assert app.state.breaker.state is CircuitState.OPEN
 
-            rejected = (await client.post("/calls", json=event_payload())).json()
+            rejected_resp = await client.post("/calls", json=event_payload())
+            assert rejected_resp.status_code == 202
+            rejected = rejected_resp.json()
             assert rejected["status"] == "deferred"
-            assert rejected["attempts"] == 0
 
             snapshot = (await client.get("/admin/circuit-breaker")).json()
             assert snapshot["state"] == "open"
