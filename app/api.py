@@ -5,14 +5,18 @@
   when the breaker accepted the event for later processing (§6.3);
 - ``GET /calls/{event_id}`` — stored record (200) / 404;
 - ``POST /admin/deferred/drain`` — force one drain pass (§5);
+- ``GET /admin/dlq`` / ``GET /admin/dlq/{id}`` — dead-letter inspection
+  (M4-T01): the full §7 row with ``event_json`` parsed under ``event``, so a
+  reviewer never has to open SQLite to see why an event died;
 - errors use the ``{"detail": ...}`` envelope.
 """
 
 from __future__ import annotations
 
 import json
+from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from app import store
 from app.models import CallEvent
@@ -23,7 +27,12 @@ router = APIRouter()
 
 
 def _record_payload(row) -> dict[str, object]:
-    """Stored row → response record; ``event_json`` parsed under ``event``."""
+    """Stored row → response record; ``event_json`` parsed under ``event``.
+
+    Every column of the row is returned, which is what makes the DLQ surfaces
+    (``reason``, ``attempts``, ``retry_count``, both failure timestamps, replay
+    fields) complete per SPECS §7 without a second serialization path.
+    """
     record = dict(row)
     record["event"] = json.loads(record.pop("event_json"))
     return record
@@ -98,6 +107,32 @@ async def drain_deferred(request: Request) -> dict[str, int]:
     ``deferred`` — a drain is an operator nudge, never a data-destroying purge.
     """
     return (await request.app.state.deferral.drain_once()).as_body()
+
+
+@router.get("/admin/dlq")
+async def list_dead_letters(
+    request: Request,
+    status: Literal["pending", "replayed"] | None = "pending",
+    limit: int = Query(default=50, ge=1, le=1000),
+) -> list[dict[str, object]]:
+    """Inspect dead letters, newest first (M4-T01; SPECS §5, §7).
+
+    ``status`` defaults to ``pending`` — the rows an operator can still act on.
+    ``?status=replayed`` returns replay history; an unknown value is rejected
+    (422) rather than silently ignored, so a typo can never look like an empty
+    DLQ.
+    """
+    rows = store.list_dead_letters(request.app.state.conn, status=status, limit=limit)
+    return [_record_payload(row) for row in rows]
+
+
+@router.get("/admin/dlq/{dlq_id}")
+async def get_dead_letter(dlq_id: int, request: Request) -> dict[str, object]:
+    """One dead-letter row by its DLQ id (M4-T01); 404 when unknown."""
+    row = store.get_dead_letter(request.app.state.conn, dlq_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"unknown dlq_id: {dlq_id}")
+    return _record_payload(row)
 
 
 def _json(body: dict[str, object], *, status_code: int) -> Response:
