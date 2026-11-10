@@ -219,7 +219,7 @@ def test_dlq_replay_with_a_healthy_dependency_completes(cli_db, capsys) -> None:
     assert body["attempted"] == 2
     assert body["succeeded"] == 2
     assert body["failed"] == 0
-    assert body["skipped"] == 0
+    assert set(body) == {"attempted", "succeeded", "failed", "results"}
 
     conn = store.connect(str(cli_db))
     try:
@@ -295,8 +295,47 @@ def test_dlq_replay_reports_an_unknown_event_id(cli_db, capsys) -> None:
     assert code == EXIT_INCOMPLETE
     body = json.loads(out)
     assert body["attempted"] == 0
-    assert body["skipped"] == 1
     assert body["results"][0]["status"] == "missing"
+
+
+# --- bounds ------------------------------------------------------------------
+
+
+def test_dlq_replay_rejects_one_id_above_the_cap(cli_db, capsys) -> None:
+    """A huge ``--event-ids`` is a usage error, not a driver failure (item D)."""
+    ids = [str(uuid4()) for _ in range(store.MAX_REPLAY_EVENT_IDS + 1)]
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--json", "dlq", "replay", "--event-ids", *ids])
+
+    assert excinfo.value.code == 2  # argparse usage error
+    err = capsys.readouterr().err
+    assert str(store.MAX_REPLAY_EVENT_IDS) in err
+
+
+def test_dlq_replay_accepts_event_ids_exactly_at_the_cap(cli_db, capsys) -> None:
+    """Exactly at the cap is allowed; nothing is replayed, so exit is incomplete."""
+    ids = [str(uuid4()) for _ in range(store.MAX_REPLAY_EVENT_IDS)]
+
+    code, out, _ = run(["--json", "dlq", "replay", "--event-ids", *ids], capsys)
+
+    assert code == EXIT_INCOMPLETE  # every id is unknown → `missing`
+    body = json.loads(out)
+    assert body["attempted"] == 0
+    assert {r["status"] for r in body["results"]} == {"missing"}
+
+
+def test_the_static_cap_is_below_the_legacy_sqlite_variable_limit() -> None:
+    """999 host parameters was SQLite's default until 3.32.0 (item D).
+
+    The cap must be genuinely safe there — a value of 1_000 would exceed it.
+    The id list is the only bound parameter in the replay query, so the cap
+    alone is what has to fit.
+    """
+    assert store.MAX_REPLAY_EVENT_IDS < 999
+    assert store.MAX_REPLAY_EVENT_IDS <= store._LEGACY_VARIABLE_LIMIT - (
+        store._REPLAY_PARAM_HEADROOM
+    )
 
 
 # --- stats ------------------------------------------------------------------

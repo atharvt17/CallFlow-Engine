@@ -73,7 +73,9 @@ fight the compose settings — see the comment in `docker-compose.yml`).
 | `make lint` | ruff check (prefers the project venv) |
 | `make calibration-report` | regenerate `reports/latency_calibration.md` (intentional; tests never write it) |
 | `make demo` | placeholder — not implemented until Sprint 6 (M5) |
-| `make dlq-replay` | placeholder — not implemented until Sprint 5 (M4) |
+| `make dlq-list` | `python -m app.cli dlq list` |
+| `make dlq-replay` | `python -m app.cli dlq replay --limit 50` |
+| `make stats` | `python -m app.cli stats` |
 
 ## Architecture (preview)
 

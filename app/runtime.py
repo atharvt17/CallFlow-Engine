@@ -8,11 +8,14 @@ here once and used by :func:`app.main.create_app` and
 :func:`app.cli.build_runtime`.
 
 The runtime is deliberately process-scoped: the circuit breaker and metrics
-live in memory. A CLI process therefore has its **own** breaker — it does not
-share the serving process's state. That is inherent to Round 1's single-process
-design (PLAN D5) and is why the CLI only replays against a database whose
-server is not concurrently replaying the same rows (the claims in
-:func:`app.store.claim_event_for_replay` still make that safe).
+live in memory. A CLI process therefore has its **own** breaker, which starts
+``closed`` on every invocation — it does not observe, mirror or update the
+serving process's breaker. Concretely: a CLI replay can dispatch while the
+server's breaker is OPEN, so the CLI must never be described as providing a
+shared live circuit breaker. What the two processes *do* share is the durable
+store, and the claims in :func:`app.store.claim_event_for_replay` keep a CLI
+replay and a server replay from processing the same event twice. The
+single-process assumption is Round 1's (PLAN D5).
 """
 
 from __future__ import annotations

@@ -261,3 +261,93 @@ async def test_restart_recovers_processing_orphans(tmp_path) -> None:
         assert (await restarted.client.get(f"/calls/{orphan_id}")).json()["status"] == "processed"
     finally:
         await restarted.close()
+
+
+async def test_crash_during_replay_leaves_no_pending_dlq_row(tmp_path) -> None:
+    """Recovery must close the dead letter of a crashed replay (SPECS §7.1).
+
+    Replay claims its row the same way the deferral drainer does
+    (``failed_downstream → processing``), so a process that dies mid-replay
+    leaves an orphan that startup recovery requeues to ``deferred``. The row is
+    then drained through the ordinary deferral path — which is a *successful
+    replay* and must resolve the existing dead letter too.
+
+    The failure this pins down: without the reconciliation, the event would end
+    ``processed`` while its ``dead_letter`` row still says ``pending`` — an
+    operator would see a replayable dead letter for an event that had already
+    succeeded, and §7.1's accounting would read ``processed`` and ``pending``
+    for the same ``event_id``.
+    """
+    db_path = tmp_path / "replay-crash.db"
+    mock_app = create_mock_app(MockSettings(latency_mu=FAST_LATENCY_MU, failure_rate=0.0))
+    settings = Settings(
+        db_path=str(db_path),
+        pipeline_backend="http",
+        pipeline_base_url="http://mock.test",
+        backoff_base_ms=0,
+    )
+
+    # --- the event dies against a broken dependency -----------------------
+    backend = FlakyMockBackend(mock_app, settings)
+    first = Process(db_path, backend, settings)
+    try:
+        event_id = str(uuid4())
+        (resp,) = await submit_all(first.client, [event_id])
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "failed_downstream"
+        dlq_id = body["dlq_id"]
+        assert dlq_rows(db_path)[0]["status"] == "pending"
+        attempts_before = (await first.client.get(f"/calls/{event_id}")).json()["attempts"]
+    finally:
+        await first.close()
+
+    # --- replay starts, then the process dies before finalizing -----------
+    from app import store as store_mod
+
+    conn = store_mod.connect(db_path)
+    try:
+        # Exactly what ``CallService._replay_one`` does before dispatching:
+        # the DLQ row stays ``pending`` until the reply is committed.
+        assert store_mod.claim_event_for_replay(conn, event_id) is True
+        assert store_mod.get_event(conn, event_id)["status"] == "processing"
+        assert store_mod.get_dead_letter(conn, dlq_id)["status"] == "pending"
+    finally:
+        conn.close()
+
+    # --- restart: the orphan is requeued and drained to success -----------
+    backend2 = FlakyMockBackend(mock_app, settings)
+    backend2.failing = False
+    restarted = Process(db_path, backend2, settings)
+    try:
+        assert restarted.app.state.deferral.pending_count() == 1
+        drain = (await restarted.client.post("/admin/deferred/drain")).json()
+        assert drain == {"drained": 1, "succeeded": 1, "failed": 0}
+
+        record = (await restarted.client.get(f"/calls/{event_id}")).json()
+        assert record["status"] == "processed"
+        assert record["dlq_id"] == dlq_id  # the §7.2 link is kept
+
+        dlq = (await restarted.client.get(f"/admin/dlq/{dlq_id}")).json()
+        assert dlq["status"] == "replayed", "a processed event must not leave a pending DLQ row"
+        assert dlq["replay_outcome"] == "processed"
+        assert dlq["replay_event_id"] == event_id
+        assert dlq["replayed_at"] is not None
+        # The DLQ row and its event agree about total work (cumulative).
+        assert dlq["attempts"] == record["attempts"]
+        assert dlq["retry_count"] == record["retry_count"] == record["attempts"] - 1
+        assert dlq["attempts"] > attempts_before
+
+        assert (await restarted.client.get("/stats")).json()["dead_letter"] == {
+            "pending": 0,
+            "replayed": 1,
+        }
+        # The Prometheus gauge follows the reconciliation, not just the store.
+        exposition = (await restarted.client.get("/metrics")).text
+        assert 'dlq_entries{status="pending"} 0.0' in exposition
+        assert 'dlq_entries{status="replayed"} 1.0' in exposition
+        # §7.1: no event is left non-terminal, and the DLQ has no stragglers.
+        assert set(statuses(db_path).values()) == {"processed"}
+        assert len(dlq_rows(db_path)) == 1
+    finally:
+        await restarted.close()

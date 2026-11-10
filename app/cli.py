@@ -20,18 +20,28 @@ HTTP-free path. Two consequences are stated rather than hidden:
   omits ``circuit_breaker``/``uptime_s``, which would otherwise be fabricated
   facts about a process this command is not talking to. Use ``GET /stats``
   (or ``GET /admin/circuit-breaker``) for live breaker state.
-- **Its own resilience stack.** ``dlq replay`` from the CLI is still a full
-  resilient replay — retries, timeout and breaker admission all apply — but
-  against a breaker built from the same settings, starting closed. Replay
-  claims (``failed_downstream → processing``) keep a CLI replay and a server
-  replay from processing the same event twice.
+- **Its own resilience stack, not the server's.** ``dlq replay`` from the CLI
+  is still a full resilient replay — retries, per-attempt timeout and breaker
+  admission all apply — but it runs against a breaker this process built from
+  the same settings, which starts ``closed`` on every invocation. The CLI
+  therefore **cannot see** the serving process's breaker: if the server's
+  breaker is OPEN, a CLI replay may still dispatch. That is not a shared live
+  circuit breaker and must not be described as one. What *is* shared is the
+  durable store: replay claims (``failed_downstream → processing``) stop a CLI
+  replay and a server replay from processing the same event twice, whichever
+  process gets there first.
+
+Use ``GET /stats`` or ``GET /admin/circuit-breaker`` for real breaker state;
+the CLI's own breaker exists only to keep replay on the same code path as HTTP
+(SPECS §7.2), not to report on the service.
 
 Exit codes (meaningful, scriptable):
 
 - ``0`` — success;
 - ``1`` — the operation ran but did not fully succeed (replay: at least one
   event failed again or was skipped; ``dlq show``: unknown id);
-- ``2`` — usage error (argparse's own code, never re-used below);
+- ``2`` — usage error (argparse's own code: bad ``--limit``, more
+  ``--event-ids`` than the store can bind);
 - ``3`` — the store could not be opened/initialised (mistyped ``DB_PATH``,
   incompatible schema).
 """
@@ -50,9 +60,11 @@ from app.config import Settings
 from app.metrics import Metrics
 from app.reporting import record_payload, stats_body
 from app.runtime import ServiceRuntime
+from app.service import ReplayReport
 
 EXIT_OK = 0
 EXIT_INCOMPLETE = 1
+EXIT_USAGE = 2  # argparse's own code; reused for late-detected usage errors
 EXIT_STORE_ERROR = 3
 
 DLQ_STATUSES = ("pending", "replayed")
@@ -123,6 +135,12 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         parser.error("--limit must be >= 1")
     if getattr(args, "limit", None) is not None and args.limit > 1000:
         parser.error("--limit must be <= 1000")
+    event_ids = getattr(args, "event_ids", None)
+    if event_ids is not None:
+        try:
+            store.check_replay_event_ids(event_ids)
+        except store.ReplayBoundsError as exc:
+            parser.error(str(exc))
 
 
 # --- output -----------------------------------------------------------------
@@ -148,21 +166,17 @@ def _format_dlq_list(rows: list[dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
-def _format_replay(report_body: dict[str, object]) -> str:
-    results = report_body["results"]
-    assert isinstance(results, list)
+def _format_replay(report: ReplayReport) -> str:
     summary = (
-        f"attempted={report_body['attempted']} succeeded={report_body['succeeded']} "
-        f"failed={report_body['failed']} deferred={report_body['deferred']} "
-        f"skipped={report_body['skipped']}"
+        f"attempted={report.attempted} succeeded={report.succeeded} "
+        f"failed={report.failed} deferred={report.deferred} "
+        f"skipped={report.skipped}"
     )
     lines = [summary]
-    for result in results:
-        assert isinstance(result, dict)
-        suffix = f" ({result['reason']})" if result.get("reason") else ""
+    for result in report.results:
+        suffix = f" ({result.reason})" if result.reason else ""
         lines.append(
-            f"  {result['event_id']}  dlq_id={result['dlq_id']}  "
-            f"{result['status']}{suffix}"
+            f"  {result.event_id}  dlq_id={result.dlq_id}  {result.status}{suffix}"
         )
     return "\n".join(lines)
 
@@ -209,28 +223,35 @@ def cmd_dlq_replay(args: argparse.Namespace, settings: Settings) -> int:
     Unlike the read commands, this needs the whole runtime (backend, breaker,
     service), not just a store handle, because a replay that skipped the
     resilience layer would be the compliance hole SPECS §7.2 forbids.
+
+    Output: ``--json`` prints the exact §5 body, so a script sees what
+    ``POST /admin/dlq/replay`` returns and nothing more. The human table also
+    reports ``deferred``/``skipped``, which are derived from ``results[].status``
+    and exist only here — they are not added to the HTTP contract (see
+    :class:`app.service.ReplayReport`).
     """
 
-    async def _run() -> dict[str, object]:
+    async def _run() -> ReplayReport:
         runtime = ServiceRuntime.build(settings)
         try:
-            report = await runtime.service.replay(
-                limit=args.limit, event_ids=args.event_ids
-            )
+            return await runtime.service.replay(limit=args.limit, event_ids=args.event_ids)
         finally:
             await runtime.aclose()
-        return report.as_body()
 
     try:
-        body = asyncio.run(_run())
-    except (OSError, sqlite3.Error, RuntimeError) as exc:
+        report = asyncio.run(_run())
+    except store.ReplayBoundsError as exc:
+        # Only reachable if the store tightened its cap after argument
+        # validation; it is still a usage problem, not a broken store.
+        raise CliError(str(exc), exit_code=EXIT_USAGE) from exc
+    except (OSError, sqlite3.Error, RuntimeError, ValueError) as exc:
         raise CliError(
             f"cannot use store at {settings.db_path}: {exc}", exit_code=EXIT_STORE_ERROR
         ) from exc
-    _emit(body, as_json=args.json, text=_format_replay(body))
+    _emit(report.as_body(), as_json=args.json, text=_format_replay(report))
     # Anything not replayed is an incomplete operation for a script: the rows
     # the operator asked about are still pending (or were never there).
-    unresolved = int(body["failed"]) + int(body["skipped"]) + int(body["deferred"])
+    unresolved = report.failed + report.skipped + report.deferred
     return EXIT_OK if unresolved == 0 else EXIT_INCOMPLETE
 
 

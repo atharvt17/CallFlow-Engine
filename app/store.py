@@ -25,6 +25,83 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from app.models import CallEvent
 
+# --- replay bounds ----------------------------------------------------------
+
+# SQLite caps host parameters per statement. The default was 999 until
+# 3.32.0 (2020-05-22), when it became 32_766; it is also configurable at
+# build/run time, so code must not assume either. ``MAX_REPLAY_EVENT_IDS`` is
+# therefore set below the *older* 999 ceiling: a named replay is bound as one
+# ``IN (...)``, and a value above 999 would fail at the driver on such a build.
+# The live connection is checked too (:func:`replay_event_id_limit`), which is
+# what catches a connection configured with an even lower limit.
+MAX_REPLAY_EVENT_IDS = 900
+
+# Pre-3.32.0 default, and the fallback when ``getlimit`` is unavailable.
+_LEGACY_VARIABLE_LIMIT = 999
+
+# Host parameters reserved for bound values other than the id list. The replay
+# query binds only ``event_ids`` today (``status`` is a literal), so this is
+# headroom for future predicates rather than a current necessity — keeping it
+# explicit means adding a bound parameter cannot silently make the cap unsafe.
+_REPLAY_PARAM_HEADROOM = 8
+
+
+class ReplayBoundsError(ValueError):
+    """A replay asked for more ``event_ids`` than the store can bind.
+
+    Its own type so callers can map it precisely: the HTTP route turns it into
+    a 422 (a bad request, not a server fault) instead of letting it surface as
+    a 500 or a driver-level ``too many SQL variables`` error.
+    """
+
+
+def variable_limit(conn: sqlite3.Connection) -> int:
+    """This connection's ``SQLITE_LIMIT_VARIABLE_NUMBER``.
+
+    ``getlimit`` exists on CPython 3.11+; the fallback is the pre-3.32.0
+    default, which is the conservative answer for an unknown build.
+    """
+    getlimit = getattr(conn, "getlimit", None)
+    if getlimit is None:
+        return _LEGACY_VARIABLE_LIMIT
+    try:
+        return int(getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+    except (AttributeError, TypeError, ValueError, sqlite3.Error):
+        return _LEGACY_VARIABLE_LIMIT
+
+
+def replay_event_id_limit(conn: sqlite3.Connection | None = None) -> int:
+    """The effective ``event_ids`` cap, tightened by this connection's limit.
+
+    Without a connection this is the static :data:`MAX_REPLAY_EVENT_IDS`, which
+    is what the HTTP body and the CLI parser validate against — they must be
+    able to reject an oversized request before touching the store. With one, the
+    cap additionally honours that connection's host-parameter budget, so a build
+    or configuration with a limit below 900 is respected rather than tripping
+    over the driver.
+    """
+    if conn is None:
+        return MAX_REPLAY_EVENT_IDS
+    return max(0, min(MAX_REPLAY_EVENT_IDS, variable_limit(conn) - _REPLAY_PARAM_HEADROOM))
+
+
+def check_replay_event_ids(
+    event_ids: list[str], conn: sqlite3.Connection | None = None
+) -> None:
+    """Raise :class:`ReplayBoundsError` if ``event_ids`` exceeds the cap.
+
+    The single validation used by every surface (HTTP route, CLI and
+    :func:`select_replayable`), so the three cannot disagree about what is
+    allowed.
+    """
+    limit = replay_event_id_limit(conn)
+    if len(event_ids) > limit:
+        raise ReplayBoundsError(
+            f"event_ids accepts at most {limit} ids (got {len(event_ids)});"
+            " replay a larger backlog with --limit / the limit field"
+        )
+
+
 # --- SPECS §7 DDL (verbatim, column for column) -----------------------------
 
 DDL_SCRIPT = """
@@ -514,10 +591,15 @@ def select_replayable(
     request for an id that is not pending is reported rather than silently
     skipped. Without it, the oldest pending rows come first — replay drains
     the backlog in failure order.
+
+    A named list longer than the effective cap (:func:`replay_event_id_limit`,
+    which honours this connection's host-parameter limit) is rejected before the
+    query runs, rather than becoming an ``IN (...)`` the driver refuses.
     """
     if event_ids is not None:
         if not event_ids:
             return []
+        check_replay_event_ids(event_ids, conn)
         placeholders = ",".join("?" for _ in event_ids)
         return list(
             conn.execute(

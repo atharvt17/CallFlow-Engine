@@ -119,22 +119,28 @@ class ReplayResult:
 class ReplayReport:
     """Result of one replay request (SPECS §5 ``POST /admin/dlq/replay``).
 
-    Counters partition ``results`` exactly, so every row the request touched
-    is accounted for:
+    SPECS §5 fixes the top-level body as
+    ``{"attempted","succeeded","failed","results":[...]}``; :meth:`as_body`
+    emits exactly those four keys, because the spec does not authorize
+    additive top-level fields and a spec-exact consumer should not have to
+    tolerate them. The extra information still has a home: §5 does not
+    constrain the entries inside ``results``, so every row's fate is carried
+    there by its ``status``.
 
-    - ``attempted`` / ``succeeded`` / ``failed`` — rows that actually went
-      through the resilient boundary, and how they ended
-      (``attempted == succeeded + failed``);
-    - ``deferred`` — the breaker refused the dispatch: no downstream call, no
-      state change, the row stays pending;
-    - ``skipped`` — the row was not replayable at all (unknown ``event_id``, or
-      an event that is no longer ``failed_downstream``). This only happens when
-      the caller names events explicitly, and it is reported rather than
-      dropped so a mistyped id can never look like a successful replay.
+    Those statuses partition ``results`` exactly — a row is never counted
+    twice and never dropped:
 
-    The last two are extensions beyond SPECS §5's four documented keys: the
-    spec's shape has no way to say "nothing was attempted", and an operator
-    needs that distinction to decide whether to retry.
+    - ``replayed`` — dispatched and succeeded;
+    - ``pending`` — dispatched and failed again (the row stays replayable);
+    - ``deferred`` — the breaker refused: no downstream call, no state change;
+    - ``missing`` / ``not_claimed`` — the row was not replayable at all
+      (unknown ``event_id``, or no longer ``failed_downstream``).
+
+    ``attempted`` therefore counts only rows that actually crossed the
+    resilient boundary (``replayed`` + ``pending``), and the invariant
+    ``attempted == succeeded + failed`` holds. The ``deferred``/``skipped``
+    properties are for our own surfaces (the CLI's summary and exit code);
+    they are not serialized, so they cannot become an accidental contract.
     """
 
     results: tuple[ReplayResult, ...] = field(default_factory=tuple)
@@ -153,19 +159,20 @@ class ReplayReport:
 
     @property
     def deferred(self) -> int:
+        """Rows the breaker refused — attempted, but never dispatched."""
         return sum(1 for r in self.results if r.status == "deferred")
 
     @property
     def skipped(self) -> int:
+        """Rows that were not replayable at all (unknown or already resolved)."""
         return sum(1 for r in self.results if r.status in ("missing", "not_claimed"))
 
     def as_body(self) -> dict[str, object]:
+        """The §5 body — exactly the four documented keys."""
         return {
             "attempted": self.attempted,
             "succeeded": self.succeeded,
             "failed": self.failed,
-            "deferred": self.deferred,
-            "skipped": self.skipped,
             "results": [r.as_body() for r in self.results],
         }
 
@@ -433,6 +440,12 @@ class CallService:
         total_attempts = int(row["attempts"]) + outcome.attempts
         total_retries = max(0, total_attempts - 1)
 
+        # An event that already carries a DLQ link got here by way of a dead
+        # letter — most importantly, a replay claimed the row, the process
+        # crashed mid-dispatch, and startup recovery requeued the orphan
+        # (``processing → deferred``). Closing that link on success is what
+        # keeps "processed event with a pending DLQ row" impossible.
+        prior_dlq_id = None if row["dlq_id"] is None else int(row["dlq_id"])
         dlq_id = self._finalize(
             event_id,
             status=status,
@@ -443,7 +456,12 @@ class CallService:
             e2e_latency_ms=e2e_latency_ms,
             failure_reason=failure_reason,
             updated_at=self._now(),
+            prior_dlq_id=prior_dlq_id,
         )
+        if result.ok and prior_dlq_id is not None:
+            # The recovered event completed an outstanding replay: count it
+            # exactly as the in-line replay success path does.
+            self._metrics.dlq_replays_total.labels(result="success").inc()
         self._metrics.calls_total.labels(outcome=outcome_value, status=status).inc()
         self._metrics.e2e_latency_ms.observe(e2e_latency_ms)
         log_event(
@@ -457,7 +475,10 @@ class CallService:
             recovered=True,
             **({"failure_reason": failure_reason, "dlq_id": dlq_id} if not result.ok else {}),
         )
-        if dlq_id is not None:
+        if dlq_id is not None or (result.ok and prior_dlq_id is not None):
+            # Either a new/refreshed dead letter (pending) or one that just
+            # moved pending → replayed; the gauge must follow the store, or it
+            # over-reports the backlog until the next DLQ write.
             self._refresh_dlq_gauge()
         return "processed" if result.ok else "failed"
 
@@ -713,12 +734,21 @@ class CallService:
         e2e_latency_ms: float | None,
         failure_reason: str | None,
         updated_at: str,
+        prior_dlq_id: int | None = None,
     ) -> int | None:
         """Commit the terminal status (and its DLQ row) in ONE transaction.
 
         SPECS §7: "event-status updates and DLQ writes execute in a single
         transaction so event status and dead-letter state can never diverge".
         Returns the dead-letter id for failures, ``None`` for successes.
+
+        ``prior_dlq_id`` closes a dead letter on a *successful* terminal flip.
+        Replay finalizes in place through :meth:`_complete_replay`, but a
+        replay interrupted by a crash comes back as a ``deferred`` row at the
+        next boot (:func:`app.store.requeue_processing_orphans`) and is then
+        drained through :meth:`process_deferred`. That drain is a successful
+        replay, so its DLQ row must become ``replayed`` too — otherwise the
+        event reads ``processed`` while its dead letter still reads ``pending``.
         """
         dlq_id: int | None = None
         with store.begin_immediate(self._conn):
@@ -752,6 +782,30 @@ class CallService:
                     event_id=event_id,
                     dlq_id=dlq_id,
                     reason=failure_reason,
+                )
+            elif status == "processed" and prior_dlq_id is not None:
+                # A dead letter was opened for this event earlier; the event
+                # is now terminal-success, so the dead letter is resolved. The
+                # counts come from the same cumulative accounting as the event
+                # row, so the two never disagree (SPECS §7.2).
+                store.mark_replayed(
+                    self._conn,
+                    prior_dlq_id,
+                    replayed_at=updated_at,
+                    replay_outcome="processed",
+                    replay_event_id=event_id,
+                    attempts=attempts,
+                    retry_count=retry_count,
+                )
+                log_event(
+                    logger,
+                    "dlq_replay",
+                    event_id=event_id,
+                    dlq_id=prior_dlq_id,
+                    result="replayed",
+                    outcome=outcome,
+                    attempts=attempts,
+                    recovered=True,
                 )
         return dlq_id
 

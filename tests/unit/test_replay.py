@@ -139,7 +139,9 @@ async def test_replay_success_updates_event_and_dlq_row_in_place(replay_stack) -
         assert body["attempted"] == 1
         assert body["succeeded"] == 1
         assert body["failed"] == 0
-        assert body["deferred"] == 0
+        assert "deferred" not in body and "skipped" not in body, (
+            "§5 fixes the top-level body; per-row detail belongs in results[]"
+        )
         assert body["results"] == [
             {
                 "event_id": event_id,
@@ -310,7 +312,7 @@ async def test_replay_respects_an_open_breaker(replay_stack) -> None:
         assert body["attempted"] == 0
         assert body["succeeded"] == 0
         assert body["failed"] == 0
-        assert body["deferred"] == 5
+        # A refusal is visible in results[] (`deferred`), not as a top-level key.
         assert {r["status"] for r in body["results"]} == {"deferred"}
         # The refusal is a real refusal: nothing reached the dependency.
         assert stack.backend.dispatches == dispatches
@@ -369,7 +371,6 @@ async def test_replay_reports_unknown_event_ids_instead_of_dropping_them(
         ).json()
         assert body["attempted"] == 0
         assert body["succeeded"] == 0
-        assert body["skipped"] == 1
         assert body["results"] == [
             {"event_id": ghost, "dlq_id": None, "status": "missing", "attempts": 0}
         ]
@@ -396,7 +397,7 @@ async def test_replay_of_an_already_replayed_event_is_not_claimed(replay_stack) 
                 "/admin/dlq/replay", json={"event_ids": [submitted["event_id"]]}
             )
         ).json()
-        assert named["skipped"] == 1
+        assert named["attempted"] == 0
         assert named["results"][0]["status"] == "missing"
     finally:
         await stack.aclose()
@@ -417,6 +418,138 @@ def test_concurrent_claims_cannot_double_process(tmp_db) -> None:
     assert store.claim_event_for_replay(tmp_db, event_id) is True
     assert store.claim_event_for_replay(tmp_db, event_id) is False
     assert store.get_event(tmp_db, event_id)["status"] == "processing"
+
+
+async def test_replay_rejects_one_id_above_the_cap(replay_stack) -> None:
+    """Bounded request, not an opaque driver error (item D)."""
+    stack = replay_stack(failing=False)
+    try:
+        ids = [str(uuid4()) for _ in range(store.MAX_REPLAY_EVENT_IDS + 1)]
+        resp = await stack.client.post("/admin/dlq/replay", json={"event_ids": ids})
+        assert resp.status_code == 422
+        assert "event_ids" in resp.text
+    finally:
+        await stack.aclose()
+
+
+async def test_replay_accepts_event_ids_exactly_at_the_cap(replay_stack) -> None:
+    """The boundary is inclusive: at the cap is a valid request."""
+    stack = replay_stack(failing=False)
+    try:
+        ids = [str(uuid4()) for _ in range(store.MAX_REPLAY_EVENT_IDS)]
+        resp = await stack.client.post("/admin/dlq/replay", json={"event_ids": ids})
+        assert resp.status_code == 200
+        body = resp.json()
+        # All unknown → reported, not dropped; the request still succeeded.
+        assert body["attempted"] == 0
+        assert len(body["results"]) == store.MAX_REPLAY_EVENT_IDS
+    finally:
+        await stack.aclose()
+
+
+def test_select_replayable_rejects_one_id_above_the_cap(tmp_db) -> None:
+    """A programmatic caller bypassing HTTP is still bounded (item D)."""
+    ids = [str(uuid4()) for _ in range(store.MAX_REPLAY_EVENT_IDS + 1)]
+    with pytest.raises(store.ReplayBoundsError, match="accepts at most"):
+        store.select_replayable(tmp_db, limit=10, event_ids=ids)
+
+
+def test_select_replayable_accepts_exactly_the_cap(tmp_db) -> None:
+    ids = [str(uuid4()) for _ in range(store.MAX_REPLAY_EVENT_IDS)]
+    assert store.select_replayable(tmp_db, limit=10, event_ids=ids) == []
+
+
+def test_rejection_happens_before_the_query_executes(tmp_db) -> None:
+    """The bound is enforced in Python, so no SQL is ever prepared (item D)."""
+
+    class ExplodingConnection:
+        """Fails the test if the store reaches the database at all."""
+
+        def execute(self, *args, **kwargs):  # pragma: no cover - must not run
+            raise AssertionError("the query must not execute")
+
+        getlimit = None
+
+    ids = [str(uuid4()) for _ in range(store.MAX_REPLAY_EVENT_IDS + 1)]
+    with pytest.raises(store.ReplayBoundsError):
+        store.select_replayable(ExplodingConnection(), limit=10, event_ids=ids)  # type: ignore[arg-type]
+
+
+def test_the_cap_honours_a_legacy_999_variable_connection(tmp_db) -> None:
+    """A connection limited to 999 host parameters tightens the cap (item D).
+
+    ``MAX_REPLAY_EVENT_IDS`` is already below 999, so this pins the *dynamic*
+    path: whatever the connection reports, ``check_replay_event_ids`` uses it,
+    and the result fits the budget with headroom to spare.
+    """
+    budget = 999
+
+    class LimitedConnection:
+        getlimit = staticmethod(lambda which: budget)
+
+    effective = store.replay_event_id_limit(LimitedConnection())  # type: ignore[arg-type]
+    assert effective == store.MAX_REPLAY_EVENT_IDS  # static cap already fits
+    assert effective + store._REPLAY_PARAM_HEADROOM <= budget
+
+    # At the cap: allowed. One above: rejected without touching SQL.
+    store.check_replay_event_ids(["x"] * effective, LimitedConnection())  # type: ignore[arg-type]
+    with pytest.raises(store.ReplayBoundsError):
+        store.check_replay_event_ids(
+            ["x"] * (effective + 1), LimitedConnection()  # type: ignore[arg-type]
+        )
+
+
+def test_a_low_variable_limit_tightens_the_cap_below_the_static_default() -> None:
+    """A configured limit under 900 must win, or the driver would fail (item D)."""
+
+    class TinyLimitConnection:
+        getlimit = staticmethod(lambda which: 300)
+
+    conn = TinyLimitConnection()  # type: ignore[assignment]
+    assert store.replay_event_id_limit(conn) == 300 - store._REPLAY_PARAM_HEADROOM
+    store.check_replay_event_ids(["x"] * 292, conn)
+    with pytest.raises(store.ReplayBoundsError):
+        store.check_replay_event_ids(["x"] * 293, conn)
+
+
+def test_variable_limit_falls_back_when_getlimit_is_unavailable() -> None:
+    """CPython < 3.11 has no ``getlimit``; the legacy default is the answer."""
+
+    class OldConnection:
+        pass
+
+    assert store.variable_limit(OldConnection()) == store._LEGACY_VARIABLE_LIMIT  # type: ignore[arg-type]
+    assert store.replay_event_id_limit(OldConnection()) == store.MAX_REPLAY_EVENT_IDS  # type: ignore[arg-type]
+
+
+async def test_route_applies_a_tighter_connection_limit_than_the_static_cap(
+    replay_stack,
+) -> None:
+    """The route re-checks against the live connection (item D).
+
+    ``ReplayRequest.max_length`` is the static, portable cap. A connection
+    configured with fewer host parameters must still be honoured — that check
+    can only happen against the real connection, so it is the route's job.
+    """
+    stack = replay_stack(failing=False)
+    real_conn = stack.app.state.conn
+
+    class LimitedConnection:
+        getlimit = staticmethod(lambda which: 300)
+
+        def __getattr__(self, name):  # delegate anything else to the real store
+            return getattr(real_conn, name)
+
+    stack.app.state.conn = LimitedConnection()
+    try:
+        # 500 ids: under the static cap (900), over this connection's 292.
+        ids = [str(uuid4()) for _ in range(500)]
+        resp = await stack.client.post("/admin/dlq/replay", json={"event_ids": ids})
+        assert resp.status_code == 422
+        assert "at most 292" in resp.text
+    finally:
+        stack.app.state.conn = real_conn
+        await stack.aclose()
 
 
 # --- /stats ----------------------------------------------------------------

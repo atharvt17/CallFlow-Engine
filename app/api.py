@@ -133,10 +133,23 @@ async def get_dead_letter(dlq_id: int, request: Request) -> dict[str, object]:
 
 
 class ReplayRequest(BaseModel):
-    """``POST /admin/dlq/replay`` body (SPECS §5); both fields optional."""
+    """``POST /admin/dlq/replay`` body (SPECS §5); both fields optional.
+
+    ``event_ids`` is capped at :data:`app.store.MAX_REPLAY_EVENT_IDS`: it
+    selects rows by name, so it is not bounded by ``limit``, and an unbounded
+    list would turn a single request into an arbitrarily large ``IN (...)``
+    query. The cap keeps the query well inside SQLite's variable limit instead
+    of failing with an opaque ``too many SQL variables`` at request time (422
+    is a usable answer; a 500 from the driver is not).
+
+    ``max_length`` is the *static* cap, chosen to be safe on any SQLite build.
+    The route re-checks against the live connection via
+    :func:`app.store.check_replay_event_ids`, which can only tighten it, so the
+    HTTP, CLI and store paths all enforce the same effective limit.
+    """
 
     limit: int = Field(default=50, ge=1, le=1000)
-    event_ids: list[str] = Field(default_factory=list)
+    event_ids: list[str] = Field(default_factory=list, max_length=store.MAX_REPLAY_EVENT_IDS)
 
 
 @router.post("/admin/dlq/replay")
@@ -149,6 +162,13 @@ async def replay_dead_letters(request: Request, body: ReplayRequest | None = Non
     rather than counted as attempted (SPECS §7.2).
     """
     payload = body or ReplayRequest()
+    conn = request.app.state.conn
+    try:
+        # Central validation, tightened by *this* connection's parameter limit.
+        store.check_replay_event_ids(payload.event_ids, conn)
+    except store.ReplayBoundsError as exc:
+        # A bad request, not a server fault — and never a driver-level crash.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     report: ReplayReport = await request.app.state.service.replay(
         limit=payload.limit,
         event_ids=payload.event_ids or None,
