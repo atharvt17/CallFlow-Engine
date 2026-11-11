@@ -10,13 +10,17 @@ deferred queue while the breaker is open, dead-letters genuine terminal failures
 **SQLite DLQ that is inspectable and replayable over both HTTP and CLI**, and exposes the
 Prometheus metrics Round 2's autoscaling will need.
 
-**Documentation map:** [`PLAN.md`](PLAN.md) strategy · [`SPECS.md`](SPECS.md) normative spec ·
-[`TASKS.md`](TASKS.md) execution tracker · [`COST.md`](COST.md) Fargate cost estimate.
+**Documentation map:** this README (setup, API, config, demo) · [`COST.md`](COST.md) Fargate
+cost estimate. The challenge-supplied planning documents (`PLAN.md`, `SPECS.md`, `TASKS.md`,
+`CHALLENGE.md`) are deliberately **not** part of the published repository — they are git-ignored
+working documents, so they are referred to here by name but not linked.
 
 > **Status:** Sprints 0–5 and M5-T01…T05 complete. Sprint 7 (cost + docs + release audit) is in
 > progress. **`reports/sample_day_report.json` is not yet committed** — the full-day demo run is
-> outstanding, so no completed Appendix C day is cited as evidence anywhere in this README
-> (see [`TASKS.md`](TASKS.md) §0 "Outstanding").
+> outstanding, so no completed Appendix C day is cited as evidence anywhere in this README.
+> The reason it is outstanding is an environment limit, not a code defect: this host has ~100 MB
+> free of 7.5 GB, which is not enough to sustain a 48-minute 23,400-call run. The measurements that
+> *were* obtained are recorded below and are labelled with the conditions they were taken under.
 
 ---
 
@@ -55,6 +59,14 @@ docker compose down                        # or: make down
 Both services self-report health, and `docker compose up -d` waits for them (compose healthchecks
 gate the inference service on the mock being healthy). That is the entire documented setup — no
 manual step beyond Docker itself.
+
+**Running a second copy of this project (or re-running the demo from scratch).** The compose
+project name is pinned (`name: callflow-engine`), so the named volume `callflow-engine_collections-data`
+is shared by *every* clone on the machine. Two clones will collide on that volume, and a "fresh"
+run against a stack that already has data will start with the old event counts. Use
+`docker compose down -v` to remove the volume when you want a genuinely empty database, or override
+the project name (`COMPOSE_PROJECT_NAME=mycopy docker compose up -d`) when you need two running
+side by side.
 
 ### Bare-metal alternative (no Docker)
 
@@ -364,7 +376,8 @@ Full detail in [`reports/latency_calibration.md`](reports/latency_calibration.md
 | Backend boundary | `PipelineBackend` Protocol, resilience wraps the protocol | Swapping dependency is configuration, not a code change |
 | Config | Flat env vars, `.env.example` committed, `.env` git-ignored | No secrets exist at all in Round 1 |
 
-Full rationale in [`PLAN.md`](PLAN.md) §3 and [`SPECS.md`](SPECS.md) §6–§7.
+Full rationale is in the challenge-supplied `PLAN.md` §3 and `SPECS.md` §6–§7 (working documents,
+not part of this repository).
 
 ## Limitations (stated, not hidden)
 
@@ -383,9 +396,9 @@ Full rationale in [`PLAN.md`](PLAN.md) §3 and [`SPECS.md`](SPECS.md) §6–§7.
 - **Operational notes, not a runbook.** Round 1 does not require the Appendix I runbook; the
   admin surfaces above (breaker state, DLQ depth, `deferred_pending`) are exactly what that
   runbook would ask an operator to check first, and are carried forward as Round 2 material.
-- **`reports/sample_day_report.json` is not committed yet.** The full-day demo run is outstanding
-  (see [`TASKS.md`](TASKS.md) §0). The run report *format* and its verdict logic are covered by
-  the test suite; the committed full-day artifact is not yet available.
+- **`reports/sample_day_report.json` is not committed yet.** The full-day demo run is outstanding,
+  blocked by host memory (~100 MB free of 7.5 GB), not by the code. The run report *format* and its
+  verdict logic are covered by the test suite; the committed full-day artifact is not yet available.
 
 ## Publication & secret audit
 
