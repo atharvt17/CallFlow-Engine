@@ -309,6 +309,40 @@ async def test_queue_overflow_never_drops_data(tmp_db) -> None:
     assert queue.peek_all() == ids[:2]
 
 
+async def test_fifo_membership_mirror_stays_exact(tmp_db) -> None:
+    """The O(1) membership set never drifts from the deque it mirrors.
+
+    ``top_up_from_db`` dedupes once per pending row, so membership is a set
+    test rather than a deque scan (a 5,000-slot FIFO against a ~9,000-row
+    backlog made the scan ~25M comparisons of blocking work per top-up).
+    That is only safe while every deque mutation keeps the mirror exact —
+    through backpressure refills, pops, and the re-queue on a breaker refusal.
+    """
+    queue, service = make_queue(tmp_db, DeferredBackend(), Settings(defer_queue_max=3))
+    service.bind_deferral(queue)
+    ids = [f"8{i}000000-0000-4000-8000-000000000000" for i in range(6)]
+    for event_id in ids:
+        seed_deferred(tmp_db, event_id)
+
+    assert queue.recover().recovered == 3
+    assert set(queue.peek_all()) == set(queue._queued)
+    assert len(queue._queued) == len(queue.peek_all())
+
+    # One pass pops the head, the boundary refuses it, and it is pushed back
+    # to the head: the mirror must neither lose nor invent an id.
+    report = await queue.drain_once(now=NOW)
+    assert (report.drained, report.succeeded, report.failed) == (1, 0, 0)
+    assert queue.peek_all() == ids[:3], "the refused event returns to the head"
+    assert set(queue.peek_all()) == set(queue._queued)
+    assert len(queue._queued) == len(queue.peek_all())
+
+    # Top-up adds unseen ids only, and the mirror follows.
+    queue.top_up_from_db()
+    assert len(queue.peek_all()) == 3
+    assert set(queue.peek_all()) == set(queue._queued)
+    assert len(queue._queued) == len(queue.peek_all())
+
+
 async def test_fifo_backpressure_refills_as_capacity_frees(tmp_db) -> None:
     """A backlog larger than the FIFO flows across passes, oldest-first."""
     queue, service = make_queue(tmp_db, ToggleBackend(ok=True), Settings(defer_queue_max=2))

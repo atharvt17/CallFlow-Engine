@@ -28,6 +28,14 @@ loop each is atomic and needs no lock. Drain passes, which do await dispatch,
 serialize on :attr:`_drain_lock`; the database side is serialized by SQLite's
 ``BEGIN IMMEDIATE`` writer lock.
 
+Membership is O(1): the deque is mirrored by a set of the same ids. Deque
+``in`` is a linear scan, and :meth:`top_up_from_db` tests membership once per
+pending row — with a full 5,000-slot FIFO against a ~9,000-row backlog that
+was ~25M comparisons of blocking work per top-up, measured at 188 ms, on the
+event loop that also has to serve dispatch timeouts. The set makes each test
+constant-time; the deque still owns ordering. Every mutation of the deque goes
+through a helper that keeps the mirror exact, so the two cannot drift.
+
 Cancellation is claim-safe. A cancelled drain — most importantly a client
 disconnect on ``POST /admin/deferred/drain`` while the application keeps
 running — returns its in-flight row to ``deferred`` and re-raises. Relying on
@@ -101,8 +109,30 @@ class DeferralQueue:
         self._metrics = metrics
         self._clock = clock or (lambda: datetime.now(UTC))
         self._items: deque[str] = deque()
+        # Membership mirror of ``_items``: deque ``in`` is O(n), and top-up
+        # tests membership once per pending row. Every deque mutation goes
+        # through the helpers below so this stays exact.
+        self._queued: set[str] = set()
         self._drain_lock = asyncio.Lock()
         self._publish_gauges()
+
+    # --- FIFO primitives (keep ``_queued`` in step with ``_items``) --------
+
+    def _contains(self, event_id: str) -> bool:
+        return event_id in self._queued
+
+    def _push_back(self, event_id: str) -> None:
+        self._items.append(event_id)
+        self._queued.add(event_id)
+
+    def _push_front(self, event_id: str) -> None:
+        self._items.appendleft(event_id)
+        self._queued.add(event_id)
+
+    def _pop_front(self) -> str:
+        event_id = self._items.popleft()
+        self._queued.discard(event_id)
+        return event_id
 
     # --- introspection ------------------------------------------------------
 
@@ -121,13 +151,13 @@ class DeferralQueue:
 
     def enqueue(self, event_id: str) -> bool:
         """Append to the FIFO; ``False`` means backpressure, never loss."""
-        if event_id in self._items:
+        if self._contains(event_id):
             return True
         if len(self._items) >= self._settings.defer_queue_max:
             log_event(logger, "deferred_backpressure", event_id=event_id)
             self._publish_gauges()
             return False
-        self._items.append(event_id)
+        self._push_back(event_id)
         self._publish_gauges()
         return True
 
@@ -136,6 +166,10 @@ class DeferralQueue:
 
         Returns how many ids were newly enqueued. Safe to call after every
         drain pass: ids already queued are skipped.
+
+        The scan stops as soon as the capacity is filled, and membership is a
+        set test, so the cost is bounded by the rows examined rather than by
+        ``pending × queue_depth``.
         """
         capacity = self._settings.defer_queue_max - len(self._items)
         if capacity > 0:
@@ -144,9 +178,9 @@ class DeferralQueue:
                 if added >= capacity:
                     break
                 event_id = row["event_id"]
-                if event_id in self._items:
+                if self._contains(event_id):
                     continue
-                self._items.append(event_id)
+                self._push_back(event_id)
                 added += 1
         else:
             added = 0
@@ -201,7 +235,7 @@ class DeferralQueue:
         async with self._drain_lock:
             drained = succeeded = failed = 0
             while self._items:
-                event_id = self._items.popleft()
+                event_id = self._pop_front()
                 self._publish_gauges()
 
                 if not store.claim_deferred_event(self._conn, event_id):
@@ -237,7 +271,7 @@ class DeferralQueue:
                 elif outcome in ("failed", "expired"):
                     failed += 1
                 else:  # deferred again — the batch waits for the next pass
-                    self._items.appendleft(event_id)
+                    self._push_front(event_id)
                     self._publish_gauges()
                     break
 
@@ -278,8 +312,8 @@ class DeferralQueue:
                 " WHERE event_id = ? AND status = 'processing'",
                 (event_id,),
             )
-        if event_id not in self._items:
-            self._items.appendleft(event_id)
+        if not self._contains(event_id):
+            self._push_front(event_id)
         self._publish_gauges()
 
     def _publish_gauges(self) -> None:

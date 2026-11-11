@@ -6,9 +6,9 @@ around a spec-exact mock of the STT→LLM→TTS pipeline
 
 > **Status:** implementation in progress per `TASKS.md`. The graded pipeline
 > contract (Sprint 1), the resilience engine and persistent deferral
-> (Sprints 3–4), and DLQ inspect/replay (Sprint 5) are complete; the traffic
-> generator (Sprint 6) and the cost writeup (Sprint 7) land in the coming
-> sprints.
+> (Sprints 3–4), DLQ inspect/replay (Sprint 5), and the compressed-day traffic
+> generator (Sprint 6) are complete; the cost writeup and release audit
+> (Sprint 7) land next.
 
 ## Prerequisites
 
@@ -72,7 +72,7 @@ fight the compose settings — see the comment in `docker-compose.yml`).
 | `make test` | pytest (prefers the project venv) |
 | `make lint` | ruff check (prefers the project venv) |
 | `make calibration-report` | regenerate `reports/latency_calibration.md` (intentional; tests never write it) |
-| `make demo` | placeholder — not implemented until Sprint 6 (M5) |
+| `make demo` | compressed Appendix C day replay against the running stack (30×, ~48 real min; writes `reports/run_<ts>.json`) |
 | `make dlq-list` | `python -m app.cli dlq list` |
 | `make dlq-replay` | `python -m app.cli dlq replay --limit 50` |
 | `make stats` | `python -m app.cli stats` |
@@ -92,6 +92,69 @@ Two services plus tooling, per `PLAN.md` §4:
 The `PipelineBackend` protocol keeps the resilience layer independent of any
 specific provider — swapping the mock for a real (or scoring-harness)
 dependency is a base-URL change, not a code change.
+
+## Compressed-day demo (`make demo`)
+
+With the stack up (`make up`), one command replays Appendix C's day against
+the live service:
+
+```bash
+make demo
+# equivalent to: python -m tools.traffic_gen
+```
+
+It prints a per-window summary and writes `reports/run_<ts>.json` (transient
+runs are gitignored).
+
+**Time compression — the honest statement.** The generator replays one
+*simulated* day of Appendix C traffic on a compressed clock. At the default
+**30×**:
+
+| | Simulated | Real (30×) |
+|---|---|---|
+| Baseline (00:00–08:00, 10 calls/min) | 10 calls/min | **300 calls/min** (~5/s) |
+| Peak hold (08:15–10:00 & 14:15–16:00, 50 calls/min) | 50 calls/min | **1,500 calls/min** (~25/s) |
+| One day (23,400 calls) | 24 h | **48 real minutes** |
+
+So a 24-hour traffic pattern is exercised in 48 minutes — compression factors
+affect *time*, not volume: the run still submits all 23,400 events. `--speedup`
+and `--duration-sim-hours` are overridable (`SPEEDUP=`, `DURATION_SIM_HOURS=`,
+`TARGET_URL=`), which is what the bounded integration test
+(`tests/integration/test_compressed_day.py`, 8.75 sim-hours at 60×, ~9 real
+minutes) uses.
+
+**What the report says, and what it refuses to say.** Every window reports its
+target rate beside the rate actually delivered — in both simulated and observed
+real terms — with the peak in-flight count and a `saturated` flag. A rate the
+run could not reach is never reported as achieved. `silent_loss` is *derived*
+(`accepted − terminal − deferred`, with the formula and its inputs printed in
+the report), not asserted, and is only meaningful once the deferred queue has
+drained; the runner waits for that before snapshotting. The report also carries
+retry statistics, circuit-breaker transitions, DLQ counts against the ~0.8%
+three-strike expectation, client-observed latency percentiles, and the
+compression factor itself.
+
+> **Capacity note — measured, not assumed.** The local two-process stack
+> (inference + mock over SQLite, the mock carrying Appendix B's real ~300 ms
+> latency) sustains **~32 calls/s**. Measured on a clean volume with a direct
+> capacity probe: 17.8 calls/s at concurrency 20, 27.3 at 50, 31.8 at 200 —
+> i.e. a flat ceiling, not a queueing artefact.
+>
+> That is why the committed sample runs at **30×**: its peak hold demands
+> 50 calls/min × 30 = 25 calls/s, which fits under the ceiling with headroom.
+> At the sanctioned **60×** the peak demands 50 calls/s, the stack saturates,
+> the breaker trips, events keep deferring until they cross `DEFER_MAX_AGE_S`,
+> and the day does not complete inside a drain budget. Running it anyway is
+> *supported and reported honestly* — every window would carry `saturated:
+> true` and the verdict would fail — but it would be evidence about this
+> machine's CPU, not about the service. `python -m tools.traffic_gen --speedup 60`
+> reproduces that path if you want to see the saturation reporting.
+>
+> The integration test escapes this by running the mock at sub-millisecond
+> latency (`FAST_LATENCY_MU = -3.0`): at 60× its peak of 50 calls/s is
+> measured comfortably in capacity (peak in-flight ~18 of 200). The demo uses
+> the real Appendix B latency, which is slower and therefore capacity-bound
+> sooner. These are two different, both-correct profiles; neither is a fudge.
 
 ## License
 

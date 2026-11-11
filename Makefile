@@ -38,9 +38,15 @@ lint:
 calibration-report:
 	$(PY) -m tools.calibration_report
 
-## demo: compressed Appendix C day replay (placeholder until Sprint 6)
+## demo: compressed Appendix C day replay against the running stack (M5-T06)
+## Needs `make up` first. Defaults to 30x over the full 24 simulated hours
+## (~48 real minutes) because the local stack sustains ~32 calls/s and 60x
+## would demand 50 calls/s at peak -- see the README capacity note. Override
+## with SPEEDUP=, DURATION_SIM_HOURS=, TARGET_URL=.
+## Writes reports/run_<ts>.json and prints the summary; exits non-zero on a
+## failed verdict.
 demo:
-	@echo "make demo: not implemented until Sprint 6 (traffic generator, milestone M5)"; exit 1
+	$(PY) -m tools.traffic_gen --speedup 30
 
 ## dlq-list: list pending dead letters without HTTP (SPECS §2)
 dlq-list:

@@ -33,3 +33,4 @@ data/*.db*
 # --- Traffic-generator run reports (transient; the committed exemplar is
 # reports/sample_day_report.json, which this pattern deliberately does not match) ---
 reports/run_*.json
+reports/_demo_stdout.txt
