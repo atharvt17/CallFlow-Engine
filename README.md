@@ -15,13 +15,18 @@ cost estimate. The challenge-supplied planning documents (`PLAN.md`, `SPECS.md`,
 `CHALLENGE.md`) are deliberately **not** part of the published repository — they are git-ignored
 working documents, so they are referred to here by name but not linked.
 
-> **Status:** Sprints 0–5 and M5-T01…T05 complete; Sprint 7 (cost + docs + release audit) complete
-> apart from two items that need a machine with more headroom than this one. **`reports/sample_day_report.json`
-> is not yet committed**, so no completed Appendix C day is cited as evidence anywhere in this
-> README. The reason is an environment limit, not a code defect: this host has ~100 MB free of
-> 7.5 GB, which is not enough to sustain a 48-minute 23,400-call run. What *was* measured is
-> recorded below and labelled with the conditions it was taken under — a clean-room compressed
-> replay completed with `verdict: PASS`, 368 events and **zero silent loss**.
+> **Status:** Sprints 0–5 complete. **Sprint 6 is 5/6** — `M5-T06` is blocked on the missing
+> full-day traffic report. **Sprint 7 is 6/8** — `M6-T05` and `M6-T08` stay under review until that
+> same report exists. One root blocker, two downstream review consequences.
+> **`reports/sample_day_report.json` is not yet committed**, so no completed Appendix C day is
+> cited as evidence anywhere in this README.
+>
+> The failed full-day run coincided with substantial host memory pressure (~100 MB free of 7.5 GB),
+> maximum configured concurrency, elevated latency and client timeouts. Resource contention is a
+> **likely** contributor; a complete run under adequate resources is still required to establish
+> the result. What *was* measured is recorded below and labelled with its conditions — a clean-room
+> compressed replay completed with `verdict: PASS`, 368 events and **zero silent loss**. That
+> proves the mechanism; it does not exercise a 23,400-event day or the campaign windows.
 
 ---
 
@@ -397,8 +402,11 @@ not part of this repository).
 - **Operational notes, not a runbook.** Round 1 does not require the Appendix I runbook; the
   admin surfaces above (breaker state, DLQ depth, `deferred_pending`) are exactly what that
   runbook would ask an operator to check first, and are carried forward as Round 2 material.
-- **`reports/sample_day_report.json` is not committed.** The full-day demo run is blocked by host
-  memory (~100 MB free of 7.5 GB), not by the code. A **clean-room compressed replay did complete
+- **`reports/sample_day_report.json` is not committed.** The full-day demo run has not completed.
+  The failed attempt coincided with host memory pressure (~100 MB free of 7.5 GB), maximum
+  concurrency, elevated latency and timeouts; contention is a *likely* contributor, but a complete
+  run under adequate resources is still needed to establish the result. A **clean-room compressed
+  replay did complete
   and passed** — 368 events, 366 processed, 2 dead-lettered, silent loss 0, `verdict: PASS` — which
   covers the report format, the verdict logic and the accounting invariant, but is 1.6% of a full
   day and exercises none of the campaign windows. The committed full-day artifact remains the one

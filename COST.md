@@ -11,7 +11,8 @@ traffic profile costs to run on Fargate, at two scaling configurations, with a r
 | Fargate Linux/x86 vCPU | **$0.04256 / vCPU-hour** | aws.amazon.com/fargate/pricing, region selector = Mumbai |
 | Fargate Linux/x86 memory | **$0.004655 / GB-hour** | same page |
 | Application Load Balancer | **$0.0239 / ALB-hour** (+ $0.008/LCU-hour) | aws.amazon.com/elasticloadbalancing/pricing, region = Mumbai |
-| NAT Gateway | **$0.056 / NAT-gateway-hour** (+ $0.05/GB processed) | aws.amazon.com/vpc/pricing, region = Mumbai |
+| NAT Gateway | **$0.056 / NAT-gateway-hour** (+ $0.056/GB processed) | aws.amazon.com/vpc/pricing, region = Mumbai |
+| Public IPv4 address | **$0.005 / in-use address-hour** | aws.amazon.com/vpc/pricing (VPC pricing, public IPv4) |
 
 Appendix D's *supplied reference* rates are ≈$0.046/vCPU-hr and ≈$0.0051/GB-hr. Those are
 **8.3% above the live ap-south-1 rates** above, so this document computes on the live rates and
@@ -97,6 +98,9 @@ $0.0562 per task-hour):
 Our arithmetic reproduces Appendix D's Config A line-for-line: **$1.80/day, $54/month**. Appendix
 D's ALB (~$18/mo) and NAT (~$40–60/mo) are consistent with live ap-south-1 rates
 ($0.0239 × 730 = **$17.45/mo**; $0.056 × 730 = **$40.88/mo** for one AZ, plus data processing).
+Note that Appendix D's overhead figures appear to stop at the two named line items; §5 below adds
+public IPv4 and LCU charges that D does not mention, which is one reason our all-in totals run
+above D's.
 
 **Where the two diverge is the rate, not the method.** Appendix D's per-vCPU rate is 8.3% above
 live Mumbai. On live rates Config A is **$49.80/month compute**, not $54 — and that is the
@@ -123,23 +127,50 @@ what a range rather than a single figure is for.
 ALB and NAT are **traffic-independent**: they are billed for being provisioned, not for how many
 calls arrive. That makes them the dominant term at this workload's size.
 
-| Item | Monthly |
-|---|---|
-| ALB (1 × $0.0239/hr × 730) | $17.45 |
-| NAT Gateway (1 × $0.056/hr × 730) | $40.88 |
-| *NAT data processing* ($0.05/GB) | small at this volume — call events are ~1 KB, ≈0.7 GB/month → **≈$0.04** |
-| **Fixed overhead subtotal** | **$58.33** |
+| Item | Monthly | Assumption |
+|---|---|---|
+| ALB hourly (1 × $0.0239/hr × 730) | $17.45 | one ALB |
+| **ALB LCU** (see below) | **$0.19** | usage-driven; sized at the 50 calls/min peak |
+| NAT Gateway hourly (1 × $0.056/hr × 730) | $40.88 | one NAT gateway, one AZ |
+| NAT data processing ($0.056/GB) | **$0.04** | ≈0.7 GB/month at ~2 KB per event |
+| **Public IPv4** ($0.005/hr × 2 × 730) | **$7.30** | **2 addresses** — the ALB and the NAT gateway |
+| **Fixed overhead subtotal** | **$65.86** | |
+
+**ALB LCU, worked out rather than waved at.** AWS bills LCU-hours in addition to the ALB hourly
+fee, at $0.008/LCU-hour. An LCU is the maximum of three normalized dimensions; at this workload's
+50 calls/min peak (0.83 req/s, ~2 KB/response, ~300 ms target processing time):
+
+| LCU dimension | Calculation | Value |
+|---|---|---|
+| New connections/sec | 0.83 / 25 | 0.033 |
+| Active connections/min | 25 / 3,000 | 0.008 |
+| Processed bytes (GB/hour) | 50 × 2 KB × 60 / 1024³ | 0.0001 |
+| **Billed LCU** | max of the above | **0.033** |
+
+At 0.033 LCU → **$0.19/month**. This is negligible, and it is negligible for a checkable reason
+(every dimension is three orders of magnitude under its 1-LCU unit), so the sensitivity is: even a
+grossly wrong traffic estimate cannot push LCU above a few dollars. An autoscaling target group
+that keeps one LCU provisioned regardless would cost $5.84/month — still small, and stated so the
+reader can substitute their own assumption.
+
+**Public IPv4 is now included, and it was the largest omission.** AWS charges $0.005 per in-use
+public IPv4 address-hour. This stack consumes **two**: the load balancer's and the NAT gateway's.
+That is **$7.30/month** — 39% of the A/B compute difference, and 11% of the total overhead. Leaving
+it out understates the total by more than the ALB LCU charge would.
 
 | Configuration | Compute | Fixed | **Total/month** |
 |---|---|---|---|
-| **Config A** (1 vCPU/2 GB, 1→5, avg 3) | $49.80 | $58.33 | **$108.12** |
-| **Config B** (0.5 vCPU/1 GB, 1→10, avg 5) | $31.12 | $58.33 | **$89.45** |
-| Config B at avg 3 | $24.90 | $58.33 | $83.23 |
+| **Config A** (1 vCPU/2 GB, 1→5, avg 3) | $49.80 | $65.86 | **$115.65** |
+| **Config B** (0.5 vCPU/1 GB, 1→10, avg 5) | $31.12 | $65.86 | **$96.98** |
+| Config B at avg 3 | $24.90 | $65.86 | $90.76 |
+| Config B at avg 6 | $34.23 | $65.86 | $100.09 |
+| Config B at avg 10 (ceiling) | $46.68 | $65.86 | $112.54 |
 
-Sensitivity worth stating plainly: **the fixed overhead is 54–70% of the total.** Halving compute
-by choosing Config B saves $18.67/month; adding a second NAT AZ (+$40.88) costs more than both
-compute configurations' difference. Cost work at this size is an availability-topology decision
-first and a task-size decision second.
+Sensitivity worth stating plainly: **the fixed overhead is 57–68% of the total** across the
+configurations modelled. Halving compute by choosing Config B saves $18.67/month; adding a second
+NAT AZ (+$40.88 hourly, +$3.65 for its public IPv4) costs more than both compute configurations'
+difference. Cost work at this size is an availability-topology decision first and a task-size
+decision second.
 
 ## 6. Tradeoffs
 
@@ -156,15 +187,16 @@ first and a task-size decision second.
   difference that is noise; at ten it is not. The measurement that would settle it — per-task
   memory floor of this image — has not been taken, so this stays an acknowledged cost of B.
 
-**Fixed overheads that do not scale.** ALB and NAT are the same $58.33/month whether the service
-handles 702,000 calls or 7,000. Only LCU charges float with traffic, and at ~1 KB per event they
-are negligible against the hourly fee. Any argument that "autoscaling will save money" has to
-beat this floor first.
+**Fixed overheads that do not scale.** The provisioned items — ALB hourly, NAT hourly and the two
+public IPv4 addresses — are the same **$65.63/month** whether the service handles 702,000 calls or
+7,000. Only LCU and NAT data processing float with traffic, and at ~2 KB per event and 0.033 LCU
+they add $0.23 to that floor. Any argument that "autoscaling will save money" has to beat this
+floor first.
 
 ## 7. Recommendation
 
-**Config B (0.5 vCPU / 1 GB, 1 → 10)** — **≈$89/month** total at the stated assumption (avg 5
-campaign tasks; $83–$96 across avg 3–6), against **Config A's ≈$108/month**.
+**Config B (0.5 vCPU / 1 GB, 1 → 10)** — **≈$97/month** all-in at the stated assumption (avg 5
+campaign tasks; $91–$100 across avg 3–6), against **Config A's ≈$116/month**.
 
 The reasoning, in order of weight:
 
@@ -178,11 +210,23 @@ The reasoning, in order of weight:
    cost, but one that only bites if the platform actually sits at the ceiling, which the
    campaign-window average says it will not.
 
+**The recommendation is robust to the overhead number.** Fixed overhead is $65.86 either way, so
+the $18.67/month difference between A and B is purely compute, and the configuration choice does
+not depend on getting LCU or IPv4 exactly right. What the overheads *do* change is the framing: at
+57–68% of the bill, the platform shape matters less than the topology.
+
 **Choose Config A instead if** per-task memory overhead proves significant for this image, or if
 the platform needs single-task CPU above 0.5 vCPU for latency headroom. Neither is measured yet;
 the honest position is that B is the better default and A is the safer one, and the tiebreaker is
 a memory-profile measurement this Round 1 does not include.
 
-**Not included:** multi-AZ NAT (+$40.88/month per additional AZ), data transfer out, CloudWatch
-logs/metrics, and Savings Plans (which would cut the compute line by up to ~50% on a 1–3 year
-commitment). All are Round 2 concerns; listing them is cheaper than pretending they are zero.
+**Not included:** multi-AZ NAT (+$40.88 hourly and +$3.65 in public IPv4 per additional AZ), data
+transfer out, CloudWatch logs/metrics, and Savings Plans (which would cut the compute line by up to
+~50% on a 1–3 year commitment). All are Round 2 concerns; listing them is cheaper than pretending
+they are zero.
+
+**Every number in this document is arithmetic on the rates in the table at the top, 730 hours per
+month, and the assumptions stated where each is used.** The three assumptions a reader should check
+against their own platform are: the average campaign-window task count (§2, §3), the 0.7 GB/month
+NAT data volume (§5), and the two public IPv4 addresses consumed by one ALB plus one NAT gateway
+(§5).
