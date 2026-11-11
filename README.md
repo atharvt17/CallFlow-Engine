@@ -15,18 +15,23 @@ cost estimate. The challenge-supplied planning documents (`PLAN.md`, `SPECS.md`,
 `CHALLENGE.md`) are deliberately **not** part of the published repository — they are git-ignored
 working documents, so they are referred to here by name but not linked.
 
-> **Status:** Sprints 0–5 complete. **Sprint 6 is 5/6** — `M5-T06` is blocked on the missing
-> full-day traffic report. **Sprint 7 is 6/8** — `M6-T05` and `M6-T08` stay under review until that
-> same report exists. One root blocker, two downstream review consequences.
-> **`reports/sample_day_report.json` is not yet committed**, so no completed Appendix C day is
-> cited as evidence anywhere in this README.
+> **Status: implementation complete, with one documented validation limitation.**
+> Sprints 0–5 are complete. **Sprint 7 is 8/8.** **Sprint 6 is 5/6** — the single open item in the
+> whole project is `M5-T06`, **BLOCKED / DEFERRED on a system resource limitation**: the full-day
+> demo cannot complete on the development host. Every other task is done, including the two review
+> tasks (`M6-T05`, `M6-T08`) that closed once their audits were performed.
+>
+> **`reports/sample_day_report.json` has not been generated**, so no completed Appendix C day is
+> cited as evidence anywhere in this README. This is a validation gap, not an implementation gap,
+> and it is reported as outstanding rather than waived.
 >
 > The failed full-day run coincided with substantial host memory pressure (~100 MB free of 7.5 GB),
 > maximum configured concurrency, elevated latency and client timeouts. Resource contention is a
-> **likely** contributor; a complete run under adequate resources is still required to establish
-> the result. What *was* measured is recorded below and labelled with its conditions — a clean-room
-> compressed replay completed with `verdict: PASS`, 368 events and **zero silent loss**. That
-> proves the mechanism; it does not exercise a 23,400-event day or the campaign windows.
+> **likely** contributor — the root cause is *not* conclusively established — and a complete run
+> under adequate resources is still required to establish the result. What *was* measured is
+> recorded below and labelled with its conditions — a clean-room compressed replay completed with
+> `verdict: PASS`, 368 events and **zero silent loss**. That proves the mechanism; it does not
+> exercise a 23,400-event day or the campaign windows.
 
 ---
 
@@ -426,6 +431,26 @@ That absence was **tested, not assumed**: a key-shaped-string grep over the trac
 **0 hits**. No `.env`, PEM, key, credential, or `.netrc`/`.pypirc`-style file has ever been added
 to the repository; the only environment file in history is the committed `.env.example` template.
 The audit evidence is recorded in `TASKS.md` under M6-T06.
+
+## Release status
+
+No release tag has been created. The project's Definition of Done requires the committed sample
+report, and that gate is unmet:
+
+| Gate | Status | Why |
+|---|---|---|
+| Implementation | **Complete** | All service code, tests, docs and audit tasks done (73 of 74 tasks) |
+| `make test` (full suite) | **PARTIAL** | 345 of 353 executed and passing; 8 capacity-bound compressed-day tests not run on this host |
+| `make demo` full day | **PARTIAL** | The report format and verdict logic are proven on a 368-event run; the full day was not executed |
+| Sample run report committed | **NOT MET** | `reports/sample_day_report.json` does not exist and has not been fabricated |
+| Specification row R13 (traffic profile) | **PARTIAL** | Same artifact |
+| Cost estimate (R15) | **MET** | `COST.md`, rates read live and cross-checked against the AWS Price List API |
+
+**Proposed exception, not applied.** The release process does not provide a mechanism for
+documented validation exceptions, so this README states the exception rather than granting it:
+ship with the sample report absent and the full-day validation outstanding, documented in this
+section and in the Limitations section above. Accepting that exception is a reviewer's decision.
+Creating the tag unilaterally would have implied the gate had been met.
 
 ## License
 
